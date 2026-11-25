@@ -1,5 +1,5 @@
 /**
- * Lite Prompt Guard (Mobile) v1.2.0
+ * Lite Prompt Guard (Mobile) v1.3.0
  *
  * Optimizador ultraligero para SillyTavern + NemoEngine en Termux / Android / Brave:
  * 1. Cero reconstrucción del DOM en #completion_prompt_manager_list (solo clases CSS y ::before/::after).
@@ -7,7 +7,9 @@
  * 3. Barra compacta persistente: buscador con debounce, "Solo ON", expandir/colapsar (+/−) y recálculo manual (↻).
  * 4. Render Guard: evita que borrar/editar/recibir mensajes ejecute PromptManager.render + tryGenerate()
  *    cuando el panel izquierdo (#left-nav-panel) está cerrado, y omite el dry-run al alternar toggles.
- * 5. Optimizadores de chat y móvil: content-visibility: auto, Modo GPU Lite (sin blur/sombras),
+ * 5. Optimizador de Regex de Nemo: detecta y desactiva los ~180+ scripts visuales pesados
+ *    (Mental Projection, Magpie, Tracker UI, Emoji FX) que congelan Brave al llegar un mensaje.
+ * 6. Optimizadores de chat y móvil: content-visibility: auto, Modo GPU Lite (sin blur/sombras),
  *    carga diferida de imágenes (lazy/async), auto-colapso de bloques thinking antiguos y escudo CSS en .mes_text.
  */
 
@@ -32,6 +34,10 @@ const SEARCH_DEBOUNCE_MS = 120;
 const RENDER_DEBOUNCE_MS = 250;
 const SECTION_DIVIDER_REGEX = /^(=+|⭐─+|━+|─{3,})/;
 const SUBHEADER_REGEX = /^<[^>]+>$/;
+const HEAVY_NEMO_REGEX_PATTERN = /\b(mental\s*projection|magpie|tracker\s*ui|emoji\s*fx|nemo\s*mp)\b/i;
+const CORE_RUNTIME_REGEX_PATTERN = /\b(nemo\s*runtime|nemo\s*story|nemo\s*commands)\b/i;
+
+let cachedRegexEngine = undefined;
 
 /** Caché en memoria de metadatos de cada <li> nativo sin mutar atributos de texto. */
 const rowMetaCache = new WeakMap();
@@ -213,6 +219,35 @@ function injectBaseStyles() {
             align-items: center;
             gap: 8px;
             margin-bottom: 6px;
+            cursor: pointer;
+        }
+
+        #lpg-regex-stats {
+            font-size: 12px;
+            padding: 6px 8px;
+            border-radius: 5px;
+            margin-bottom: 8px;
+            background: var(--SmartThemeBlurTintColor, rgba(255, 255, 255, 0.05));
+            border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.14));
+        }
+
+        #lpg-regex-stats.lpg-warn {
+            border-color: rgba(255, 152, 0, 0.7);
+            background: rgba(255, 152, 0, 0.12);
+        }
+
+        #lpg-settings-panel .lpg-btn-stack {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+
+        #lpg-settings-panel .lpg-action-btn {
+            width: 100%;
+            text-align: center;
+            padding: 6px 10px;
+            font-size: 12px;
             cursor: pointer;
         }
     `);
@@ -879,6 +914,8 @@ function attachListObserver() {
  * Observa #completion_prompt_manager de forma superficial para detectar reemplazos de la lista.
  */
 function observePromptManager() {
+    patchPromptManager();
+
     const pmContainer = document.getElementById('completion_prompt_manager');
     if (!pmContainer) return;
 
@@ -890,11 +927,175 @@ function observePromptManager() {
     }
 
     containerObserver = new MutationObserver(() => {
+        patchPromptManager();
         attachListObserver();
     });
     containerObserver.observe(pmContainer, { childList: true, subtree: false });
 
     attachListObserver();
+}
+
+/**
+ * Carga de forma segura el motor de Regex integrado en SillyTavern.
+ */
+async function getRegexEngine() {
+    if (cachedRegexEngine !== undefined) return cachedRegexEngine;
+    try {
+        cachedRegexEngine = await import('../../regex/engine.js');
+    } catch (err) {
+        console.warn('[Lite Prompt Guard] No se pudo cargar regex/engine.js:', err);
+        cachedRegexEngine = null;
+    }
+    return cachedRegexEngine;
+}
+
+/**
+ * Determina si un script Regex de Nemo es puramente visual/pesado (Mental Projection, Magpie, Tracker, Emoji FX).
+ * Mantiene intactos los scripts esenciales de ejecución (Nemo Runtime, Nemo Story, Nemo Commands).
+ * @param {object} script
+ * @returns {boolean}
+ */
+function isHeavyVisualNemoRegex(script) {
+    if (!script || typeof script !== 'object') return false;
+    const name = String(script.scriptName || '');
+    if (HEAVY_NEMO_REGEX_PATTERN.test(name)) return true;
+    if (script.markdownOnly && !CORE_RUNTIME_REGEX_PATTERN.test(name) && String(script.findRegex || '').length > 2500) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Actualiza el indicador del optimizador de Regex dentro del panel de Extensiones.
+ */
+async function refreshRegexStatsUI() {
+    const statsEl = document.getElementById('lpg-regex-stats');
+    if (!statsEl) return;
+
+    const disableHeavyBtn = document.getElementById('lpg-regex-disable-heavy');
+    const disallowAllBtn = document.getElementById('lpg-regex-disallow-all');
+    const restoreAllBtn = document.getElementById('lpg-regex-restore-all');
+
+    const engine = await getRegexEngine();
+    if (!engine) {
+        statsEl.classList.remove('lpg-warn');
+        statsEl.textContent = 'Motor Regex no disponible en esta versión de SillyTavern.';
+        [disableHeavyBtn, disallowAllBtn, restoreAllBtn].forEach((b) => { if (b) b.disabled = true; });
+        return;
+    }
+
+    const apiId = engine.getCurrentPresetAPI?.();
+    const presetName = engine.getCurrentPresetName?.();
+    if (!apiId || !presetName) {
+        statsEl.classList.remove('lpg-warn');
+        statsEl.textContent = 'Sin preset de Chat Completion activo.';
+        return;
+    }
+
+    const allowed = Boolean(engine.isPresetScriptsAllowed?.(apiId, presetName));
+    const scripts = engine.getScriptsByType?.(engine.SCRIPT_TYPES.PRESET, { allowedOnly: false });
+    const list = Array.isArray(scripts) ? scripts : [];
+    const total = list.length;
+    const enabledCount = list.filter((s) => s && !s.disabled).length;
+    const heavyEnabledCount = list.filter((s) => s && !s.disabled && isHeavyVisualNemoRegex(s)).length;
+
+    if (total === 0) {
+        statsEl.classList.remove('lpg-warn');
+        statsEl.textContent = `Preset "${presetName}": sin scripts Regex integrados.`;
+        return;
+    }
+
+    if (!allowed) {
+        statsEl.classList.remove('lpg-warn');
+        statsEl.textContent = `Regex del preset "${presetName}": PAUSADOS (0/${total} activos — máxima velocidad).`;
+        return;
+    }
+
+    statsEl.classList.toggle('lpg-warn', enabledCount >= 30);
+    statsEl.textContent = `Preset "${presetName}": ${enabledCount}/${total} Regex activos (${heavyEnabledCount} visuales pesados).`;
+}
+
+/**
+ * Desactiva únicamente los Regex visuales pesados de Nemo (Mental Projection, Magpie, Tracker, Emoji FX).
+ */
+async function disableHeavyNemoRegexes() {
+    const engine = await getRegexEngine();
+    if (!engine) return;
+
+    const scripts = engine.getScriptsByType?.(engine.SCRIPT_TYPES.PRESET, { allowedOnly: false });
+    if (!Array.isArray(scripts) || scripts.length === 0) {
+        window.toastr?.info('El preset actual no tiene scripts Regex.', 'Lite Prompt Guard');
+        return;
+    }
+
+    let disabledNow = 0;
+    const updated = scripts.map((script) => {
+        if (script && !script.disabled && isHeavyVisualNemoRegex(script)) {
+            disabledNow++;
+            return { ...script, disabled: true };
+        }
+        return script;
+    });
+
+    if (disabledNow > 0) {
+        await engine.saveScriptsByType(updated, engine.SCRIPT_TYPES.PRESET);
+    }
+
+    await refreshRegexStatsUI();
+    window.toastr?.success(
+        disabledNow > 0
+            ? `Se desactivaron ${disabledNow} Regex visuales pesados de Nemo (Runtime/Story intactos).`
+            : 'Los Regex visuales pesados ya estaban desactivados.',
+        'Lite Prompt Guard',
+    );
+}
+
+/**
+ * Pausa todos los Regex del preset actual al instante sin modificar el archivo JSON del preset.
+ */
+async function disallowAllPresetRegexes() {
+    const engine = await getRegexEngine();
+    if (!engine) return;
+
+    const apiId = engine.getCurrentPresetAPI?.();
+    const presetName = engine.getCurrentPresetName?.();
+    if (!apiId || !presetName) return;
+
+    engine.disallowPresetScripts(apiId, presetName);
+    await refreshRegexStatsUI();
+    window.toastr?.info(`Regex del preset "${presetName}" pausados.`, 'Lite Prompt Guard');
+}
+
+/**
+ * Reactiva los permisos del preset y vuelve a habilitar los Regex visuales de Nemo.
+ */
+async function restoreAllPresetRegexes() {
+    const engine = await getRegexEngine();
+    if (!engine) return;
+
+    const apiId = engine.getCurrentPresetAPI?.();
+    const presetName = engine.getCurrentPresetName?.();
+    if (!apiId || !presetName) return;
+
+    engine.allowPresetScripts(apiId, presetName);
+
+    const scripts = engine.getScriptsByType?.(engine.SCRIPT_TYPES.PRESET, { allowedOnly: false });
+    if (Array.isArray(scripts) && scripts.length > 0) {
+        let restored = 0;
+        const updated = scripts.map((script) => {
+            if (script && script.disabled && isHeavyVisualNemoRegex(script)) {
+                restored++;
+                return { ...script, disabled: false };
+            }
+            return script;
+        });
+        if (restored > 0) {
+            await engine.saveScriptsByType(updated, engine.SCRIPT_TYPES.PRESET);
+        }
+    }
+
+    await refreshRegexStatsUI();
+    window.toastr?.info(`Regex del preset "${presetName}" restaurados.`, 'Lite Prompt Guard');
 }
 
 /**
@@ -956,11 +1157,31 @@ function mountExtensionSettings() {
                     <input type="checkbox" id="lpg-setting-css-guard" />
                     <span>Escudo CSS anti-rotura en mensajes (.mes_text)</span>
                 </label>
+
+                <div class="lpg-group-title">Optimizador de Regex (Nemo)</div>
+                <div id="lpg-regex-stats">Analizando Regex del preset...</div>
+                <div class="lpg-btn-stack">
+                    <button type="button" id="lpg-regex-disable-heavy" class="menu_button lpg-action-btn">
+                        Quitar Regex pesados de Nemo (Mental Projection / Magpie / Tracker)
+                    </button>
+                    <button type="button" id="lpg-regex-disallow-all" class="menu_button lpg-action-btn">
+                        Pausar TODOS los Regex del preset (máxima velocidad)
+                    </button>
+                    <button type="button" id="lpg-regex-restore-all" class="menu_button lpg-action-btn">
+                        Restaurar Regex del preset
+                    </button>
+                </div>
             </div>
         </div>
     `;
 
     container.appendChild(wrapper);
+
+    wrapper.querySelector('#lpg-regex-disable-heavy')?.addEventListener('click', disableHeavyNemoRegexes);
+    wrapper.querySelector('#lpg-regex-disallow-all')?.addEventListener('click', disallowAllPresetRegexes);
+    wrapper.querySelector('#lpg-regex-restore-all')?.addEventListener('click', restoreAllPresetRegexes);
+    wrapper.querySelector('.inline-drawer-toggle')?.addEventListener('click', refreshRegexStatsUI);
+    refreshRegexStatsUI();
 
     const bindings = [
         ['#lpg-setting-sections', 'sectionsEnabled', () => scheduleVisibilityUpdate()],
@@ -995,6 +1216,7 @@ function registerSillyTavernEvents() {
         mountToolbar();
         observePromptManager();
         observeLazyContainers();
+        refreshRegexStatsUI();
     };
 
     const resetPresetSections = () => {
@@ -1013,6 +1235,12 @@ function registerSillyTavernEvents() {
     if (event_types?.CHARACTER_SELECTED) eventSource.on(event_types.CHARACTER_SELECTED, refresh);
     if (event_types?.OAI_PRESET_CHANGED_AFTER) eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, resetPresetSections);
     if (event_types?.MAIN_API_CHANGED) eventSource.on(event_types.MAIN_API_CHANGED, resetPresetSections);
+
+    for (const evt of ['GENERATION_STARTED', 'GENERATION_ENDED', 'MESSAGE_SENT', 'MESSAGE_RECEIVED', 'MESSAGE_DELETED', 'MESSAGE_EDITED']) {
+        if (event_types?.[evt]) {
+            eventSource.on(event_types[evt], patchPromptManager);
+        }
+    }
 
     for (const evt of ['MESSAGE_RECEIVED', 'MESSAGE_SENT', 'MESSAGE_DELETED', 'MESSAGE_SWIPED']) {
         if (event_types?.[evt]) {
@@ -1034,4 +1262,5 @@ jQuery(() => {
     observePromptManager();
     observeLazyContainers();
     registerSillyTavernEvents();
+    setTimeout(patchPromptManager, 1500);
 });

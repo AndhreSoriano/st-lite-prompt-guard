@@ -16,7 +16,10 @@ Extensión ultraligera para **SillyTavern** optimizada para **Termux + Android /
 
 ## 1. Qué problemas de SillyTavern y Nemo resuelve
 
-1. **Bajón al borrar, editar o recibir mensajes (`PromptManager.renderDebounced`):**
+1. **Congelamiento de varios segundos al recibir un mensaje del bot (262 Regex activos de NemoEngine):**
+   - Los presets de `NemoEngine` traen **273 scripts Regex incrustados (262 activos, 237 de visualización)** —incluyendo `Mental Projection` (117), `Nemo + Magpie` (37), `Tracker UI` (19) y expresiones de hasta 6.464 caracteres— que SillyTavern ejecuta síncronamente en el hilo principal de Brave cada vez que termina el mensaje del bot (y repetidamente si usas **Streaming**).
+   - **Solución (v1.3.0):** En **Extensions → Lite Prompt Guard (Mobile) → Optimizador de Regex (Nemo)** puedes desactivar en 1 toque solo los Regex visuales pesados (dejando intactos `Nemo Runtime` / `Nemo Story` / `Nemo Commands`) o pausar todos los Regex del preset al instante.
+2. **Bajón al borrar, editar o recibir mensajes (`PromptManager.renderDebounced`):**
    - En SillyTavern (`PromptManager.js`), cada `MESSAGE_DELETED`, `MESSAGE_EDITED` o `MESSAGE_RECEIVED` dispara `renderDebounced()` → `tryGenerate()` (simulación completa de contexto y conteo de tokens de los 400–630+ bloques de Nemo) y reconstruye toda la lista del Prompt Manager aunque el panel lateral esté **cerrado**.
    - **Solución:** el **Render Guard** pospone esos re-renders mientras `#left-nav-panel` está cerrado y solo actualiza cuando abres el panel.
 2. **Lag al activar/desactivar módulos de Nemo:**
