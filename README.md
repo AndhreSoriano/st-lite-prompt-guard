@@ -1,6 +1,6 @@
 # Lite Prompt Guard (Mobile) para SillyTavern
 
-Extensión ultraligera para **SillyTavern** (especialmente pensada para **Termux + Android / Brave**), diseñada como reemplazo de `NemoPresetExt` para mantener presets grandes de **NemoEngine** (400–630+ bloques) ordenados y fluidos sin reconstruir el DOM.
+Extensión ultraligera para **SillyTavern** optimizada para **Termux + Android / Brave**, diseñada como reemplazo de `NemoPresetExt` para mantener presets grandes de **NemoEngine** (400–630+ bloques) ordenados y eliminar los tirones de rendimiento al usar el chat o borrar mensajes.
 
 ## Instalación rápida desde SillyTavern (Git URL)
 
@@ -12,26 +12,33 @@ Extensión ultraligera para **SillyTavern** (especialmente pensada para **Termux
    ```
 4. Haz clic en **Install for all users** (o **Install for current user**) y recarga la página.
 
-> **Configuración en Extensions → Lite Prompt Guard (Mobile):**
-> - **Agrupar secciones de Nemo (`===`, `⭐─`, `━`) colapsables** (activado por defecto)
-> - **Iniciar con secciones colapsadas** (activado por defecto: en móvil/Termux solo pinta ~20 cabeceras en vez de 600+ filas)
-> - **Activar escudo CSS anti-rotura en mensajes (`.mes_text`)** (activado por defecto)
+---
+
+## 1. Qué problemas de SillyTavern y Nemo resuelve
+
+1. **Bajón al borrar, editar o recibir mensajes (`PromptManager.renderDebounced`):**
+   - En SillyTavern (`PromptManager.js`), cada `MESSAGE_DELETED`, `MESSAGE_EDITED` o `MESSAGE_RECEIVED` dispara `renderDebounced()` → `tryGenerate()` (simulación completa de contexto y conteo de tokens de los 400–630+ bloques de Nemo) y reconstruye toda la lista del Prompt Manager aunque el panel lateral esté **cerrado**.
+   - **Solución:** el **Render Guard** pospone esos re-renders mientras `#left-nav-panel` está cerrado y solo actualiza cuando abres el panel.
+2. **Lag al activar/desactivar módulos de Nemo:**
+   - Activa el modo **Toggle rápido** (usa `render(false)` sin `tryGenerate()`), manteniendo un botón **`↻`** en la barra para recalcular tokens manualmente cuando lo necesites.
+3. **Saturación del DOM con presets de 400–630+ bloques:**
+   - Detecta los divisores nativos de Nemo (`===`, `⭐─`, `━`, `───`) y subcabeceras (`<...>`) **sin clonar ni mover ningún `<li>`**, iniciando colapsado para pintar solo ~20 cabeceras en pantalla.
+   - Incluye barra persistente con buscador con *debounce* (120 ms), botón **`Solo ON`** y botones **`+` / `−`**.
+4. **Scroll lento, consumo de GPU y RAM en Android/Brave:**
+   - **`content-visibility: auto`** en mensajes del chat (`.mes`) y tarjetas de personajes (`.character_select`).
+   - **Modo GPU Lite:** desactiva `backdrop-filter: blur`, sombras pesadas y transiciones UI en paneles y mensajes.
+   - **Carga diferida (`loading="lazy"`, `decoding="async"`)** en imágenes y avatares.
+   - **Auto-colapso** de bloques de razonamiento (`thinking` / `<details>`) en mensajes antiguos.
+   - **Escudo CSS anti-rotura** para `.mes_text` que evita que HTML/CSS de presets se encime sobre avatares o mensajes anteriores.
 
 ---
 
-## 1. Diagnóstico técnico: por qué falla y va lento `NemoPresetExt` en Android / Termux
+## 2. Ajustes recomendados extra en Termux / SillyTavern
 
-En navegadores móviles (Brave en Android) conectados a SillyTavern en Termux, el presupuesto de cálculo por frame y la memoria RAM por pestaña son muy reducidos:
-
-1. **Sobrecarga del DOM y *Reflows*:** SillyTavern reconstruye el contenido de `#completion_prompt_manager` y `#completion_prompt_manager_list` mediante `innerHTML = ''` en cada render. `NemoPresetExt` intercepta esa lista e inyecta contenedores, grids, bandejas, *tooltips* y múltiples listeners extra, disparando *Forced Synchronous Layouts* (lag severo y cierres por falta de RAM).
-2. **Evaluación excesiva en presets grandes:** Los presets de NemoEngine superan los 400–600 módulos. Renderizar y evaluar cientos de nodos visibles a la vez congela el scroll táctil en móvil.
-3. **Rotura de diseño CSS en `.mes_text`:** Algunos presets o reglas Regex inyectan HTML/CSS con `position: absolute/fixed`, `z-index` altos, `transform` o márgenes negativos que se salen de la burbuja y se superponen sobre avatares o mensajes anteriores.
-
----
-
-## 2. Qué hace `Lite Prompt Guard (Mobile)`
-
-- **Cero reconstrucción del DOM:** No mueve, clona ni envuelve ningún `<li class="completion_prompt_manager_prompt">` nativo. Solo aplica clases CSS mínimas (`.lpg-section`, `.lpg-subheader`, `.lpg-open`, `.lpg-hidden`).
-- **Organizador colapsable de NemoEngine:** Detecta los divisores nativos de Nemo (`=== ... ===`, `⭐─`, `━`, `───`) como carpetas colapsables con contador `activos/total` mediante pseudo-elementos CSS (`::before` y `::after`), y da jerarquía visual a las subcabeceras (`<Core: ...>`). Mantiene abiertas tus secciones aunque SillyTavern re-renderice la lista al pulsar un toggle.
-- **Barra compacta fuera del contenedor que se vacía:** Monta un único buscador con *debounce* (120 ms), botón **Solo ON** (filtra módulos activos), y botones **`+` / `−`** para expandir o colapsar todas las secciones en un toque, sin perder el foco ni cerrar el teclado de Android.
-- **Escudo CSS anti-rotura en `.mes_text`:** Fuerza `overflow: hidden !important; isolation: isolate !important;` en `.mes_text` y `position: static !important; max-width: 100% !important; overflow-wrap: break-word !important;` en `.mes_text *`, neutralizando coordenadas, `transform` y márgenes negativos inline.
+- En `config.yaml` de SillyTavern (Termux):
+  - `performance.lazyLoadCharacters: true`
+  - `thumbnails.enabled: true` (`format: 'webp'`, `quality: 75`)
+- En **User Settings** de SillyTavern:
+  - **# of messages to load:** `20` o `30` (reduce mucho la RAM inicial en móvil).
+- En **Extensions → Manage Extensions**:
+  - Desactiva extensiones integradas que no uses (TTS, Image Generation, Vector Storage, etc.).
