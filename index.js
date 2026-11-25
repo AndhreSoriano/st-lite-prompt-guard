@@ -1,16 +1,16 @@
 /**
- * Lite Prompt Guard (Mobile) v1.4.0
+ * Lite Prompt Guard (Mobile) v1.5.0
  *
  * Optimizador ultraligero para SillyTavern + NemoEngine en Termux / Android / Brave:
  * 1. Cero reconstrucción del DOM en #completion_prompt_manager_list (solo clases CSS y ::before/::after).
- * 2. Secciones colapsables para divisores de Nemo (===, ⭐─, ━, ───) y subcabeceras (<...>).
- * 3. Barra compacta persistente: buscador con debounce, "Solo ON", expandir/colapsar (+/−) y recálculo manual (↻).
- * 4. Render Guard: evita que borrar/editar/recibir mensajes ejecute PromptManager.render + tryGenerate()
- *    cuando el panel izquierdo (#left-nav-panel) está cerrado, y omite el dry-run al alternar toggles.
- * 5. Acelerador automático de Regex: pre-filtro literal sin desactivar scripts (40x+ más rápido en Nemo).
- * 6. Optimizador manual de Regex de Nemo (desactivar visuales pesados o pausar todos).
- * 7. Optimizadores de chat y móvil: content-visibility: auto, Modo GPU Lite, lazy images,
- *    auto-colapso de bloques thinking antiguos y escudo CSS en .mes_text.
+ * 2. Toggle y edición de prompts instantáneos (<1 ms): actualiza solo la fila <li> modificada sin
+ *    reconstruir los 600+ nodos ni re-inicializar jQuery UI sortable() en cada clic.
+ * 3. Secciones colapsables para divisores de Nemo (===, ⭐─, ━, ───) y subcabeceras (<...>).
+ * 4. Barra compacta persistente: buscador con debounce, "Solo ON", expandir/colapsar (+/−) y recálculo manual (↻).
+ * 5. Render Guard: evita re-renders al borrar/editar/recibir mensajes y abre #left-nav-panel en 0 ms.
+ * 6. Acelerador automático de Regex: pre-filtro literal sin desactivar scripts (40x+ más rápido en Nemo).
+ * 7. Optimizador manual de Regex de Nemo y mejoras móviles (content-visibility, GPU Lite, lazy images,
+ *    auto-colapso thinking y escudo CSS en .mes_text).
  */
 
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
@@ -56,7 +56,7 @@ const openSections = new Set();
 
 let initializedPresetSections = false;
 let onlyActiveFilter = false;
-let deferredRenderPending = false;
+let deferredStructureDirty = false;
 let forceFullRender = false;
 let regexSkippedCount = 0;
 let lastLowerSrc = '';
@@ -64,6 +64,7 @@ let lastLowerVal = '';
 
 let searchDebounceTimer = null;
 let renderDebouncedTimer = null;
+let sortableTimer = null;
 let visibilityFrameId = null;
 let chatMaintenanceFrameId = null;
 
@@ -73,6 +74,7 @@ let drawerObserver = null;
 let chatObserver = null;
 let charListObserver = null;
 let sectionClickBound = false;
+let editSaveBound = false;
 
 /**
  * Inicializa y devuelve la configuración persistente de la extensión.
@@ -388,22 +390,36 @@ function isAiConfigPanelOpen() {
 }
 
 /**
+ * Comprueba si #completion_prompt_manager_list ya tiene filas renderizadas.
+ * @returns {boolean}
+ */
+function hasRenderedPromptItems() {
+    return Boolean(document.querySelector('#completion_prompt_manager_list > .completion_prompt_manager_prompt'));
+}
+
+/**
  * Protege la instancia de PromptManager contra re-renders costosos al borrar/editar/recibir
- * mensajes mientras el panel está cerrado, y omite tryGenerate() cuando fastToggle está activo.
+ * mensajes, pospone makeDraggable() y omite tryGenerate() cuando fastToggle está activo.
  */
 function patchPromptManager() {
     if (!promptManager || patchedPromptManagers.has(promptManager)) return;
 
     const origRender = promptManager.render.bind(promptManager);
+    const origMakeDraggable = typeof promptManager.makeDraggable === 'function'
+        ? promptManager.makeDraggable.bind(promptManager)
+        : null;
 
     promptManager.render = function (afterTryGenerate = true) {
         const settings = getSettings();
 
         if (!forceFullRender && settings.deferHiddenRender && !isAiConfigPanelOpen()) {
-            deferredRenderPending = true;
+            if (!hasRenderedPromptItems()) {
+                deferredStructureDirty = true;
+            }
             return;
         }
 
+        deferredStructureDirty = false;
         const effectiveDryRun = forceFullRender
             ? true
             : (settings.fastToggle ? false : afterTryGenerate);
@@ -417,9 +433,28 @@ function patchPromptManager() {
         }
         renderDebouncedTimer = setTimeout(() => {
             renderDebouncedTimer = null;
+            const settings = getSettings();
+            if (settings.deferHiddenRender && !isAiConfigPanelOpen() && hasRenderedPromptItems()) {
+                return;
+            }
             promptManager.render(true);
         }, RENDER_DEBOUNCE_MS);
     };
+
+    if (origMakeDraggable) {
+        promptManager.makeDraggable = function () {
+            if (!getSettings().fastToggle) {
+                return origMakeDraggable();
+            }
+            if (sortableTimer !== null) {
+                clearTimeout(sortableTimer);
+            }
+            sortableTimer = setTimeout(() => {
+                sortableTimer = null;
+                origMakeDraggable();
+            }, 150);
+        };
+    }
 
     patchedPromptManagers.add(promptManager);
 }
@@ -439,7 +474,7 @@ function forceRecalculateTokens() {
 }
 
 /**
- * Observa la apertura del panel izquierdo (#left-nav-panel) para aplicar renders pendientes.
+ * Observa la apertura del panel izquierdo (#left-nav-panel) y solo renderiza si la estructura cambió.
  */
 function observeDrawerOpen() {
     const panel = document.getElementById('left-nav-panel');
@@ -451,8 +486,8 @@ function observeDrawerOpen() {
     }
 
     drawerObserver = new MutationObserver(() => {
-        if (deferredRenderPending && isAiConfigPanelOpen()) {
-            deferredRenderPending = false;
+        if ((deferredStructureDirty || !hasRenderedPromptItems()) && isAiConfigPanelOpen()) {
+            deferredStructureDirty = false;
             if (promptManager) {
                 promptManager.render(!getSettings().fastToggle);
             }
@@ -864,20 +899,66 @@ function mountToolbar() {
 }
 
 /**
- * Registra un único listener delegado (fase de captura) en #completion_prompt_manager
- * para abrir/cerrar secciones de Nemo sin abrir el modal de inspección nativo.
+ * Alterna en el acto (in-place, <1 ms) un módulo del Prompt Manager sin reconstruir los 600+ nodos.
+ * @param {Element} toggleEl
+ * @param {MouseEvent} event
+ * @returns {boolean} true si se manejó en el acto
  */
-function bindDelegatedSectionClick() {
+function handleInstantToggle(toggleEl, event) {
+    if (!getSettings().fastToggle || !promptManager || !promptManager.activeCharacter) return false;
+
+    const row = toggleEl.closest('.completion_prompt_manager_prompt');
+    const promptId = row?.dataset?.pmIdentifier;
+    if (!promptId) return false;
+
+    const entry = promptManager.getPromptOrderEntry?.(promptManager.activeCharacter, promptId);
+    if (!entry) return false;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const counts = promptManager.tokenHandler?.getCounts?.();
+    if (counts) {
+        counts[promptId] = null;
+    }
+
+    entry.enabled = !entry.enabled;
+
+    row.classList.toggle('completion_prompt_manager_prompt_disabled', !entry.enabled);
+    toggleEl.classList.toggle('fa-toggle-on', entry.enabled);
+    toggleEl.classList.toggle('fa-toggle-off', !entry.enabled);
+
+    const tokEl = row.querySelector('.prompt_manager_prompt_tokens');
+    if (tokEl) {
+        tokEl.dataset.pmTokens = '-';
+        tokEl.textContent = '-';
+    }
+
+    promptManager.saveServiceSettings?.();
+    scheduleVisibilityUpdate();
+    return true;
+}
+
+/**
+ * Registra un único listener delegado (fase de captura) en #completion_prompt_manager
+ * para toggles instantáneos y para abrir/cerrar secciones de Nemo sin abrir el modal nativo.
+ */
+function bindPromptManagerDelegatedClicks() {
     if (sectionClickBound) return;
 
     const pmContainer = document.getElementById('completion_prompt_manager');
     if (!pmContainer) return;
 
     pmContainer.addEventListener('click', (event) => {
-        if (!getSettings().sectionsEnabled) return;
-
         const target = event.target instanceof Element ? event.target : null;
         if (!target) return;
+
+        const toggleEl = target.closest('.prompt-manager-toggle-action');
+        if (toggleEl && handleInstantToggle(toggleEl, event)) {
+            return;
+        }
+
+        if (!getSettings().sectionsEnabled) return;
 
         const sectionRow = target.closest('.completion_prompt_manager_prompt.lpg-section');
         if (!sectionRow) return;
@@ -897,6 +978,65 @@ function bindDelegatedSectionClick() {
     }, true);
 
     sectionClickBound = true;
+}
+
+/**
+ * Guarda cambios de edición de un prompt existente en el acto sin reconstruir toda la lista.
+ */
+function bindInstantEditSave() {
+    if (editSaveBound) return;
+
+    const saveBtn = document.getElementById('completion_prompt_manager_popup_entry_form_save');
+    if (!saveBtn) return;
+
+    saveBtn.addEventListener('click', (event) => {
+        if (!getSettings().fastToggle || !promptManager) return;
+
+        const promptId = saveBtn.dataset?.pmPrompt;
+        if (!promptId) return;
+
+        const prompt = promptManager.getPromptById?.(promptId);
+        if (!prompt) return; // Creación de prompt nuevo -> dejar flujo nativo
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        promptManager.updatePromptWithPromptEditForm?.(prompt);
+
+        if (document.getElementById(`${promptId}_prompt`) && typeof promptManager.updateQuickEdit === 'function') {
+            promptManager.updateQuickEdit(promptId, prompt);
+        }
+
+        promptManager.hidePopup?.();
+        promptManager.clearEditForm?.();
+
+        const listEl = document.getElementById('completion_prompt_manager_list');
+        if (listEl) {
+            const rows = listEl.querySelectorAll(':scope > .completion_prompt_manager_prompt');
+            for (let i = 0; i < rows.length; i++) {
+                const row = rows[i];
+                if (row.dataset?.pmIdentifier !== promptId) continue;
+
+                const nameWrap = row.querySelector('.completion_prompt_manager_prompt_name');
+                if (nameWrap) {
+                    const newName = prompt.name || '';
+                    nameWrap.dataset.pmName = newName;
+                    const titleEl = nameWrap.querySelector('.prompt-manager-inspect-action, span[title]');
+                    if (titleEl) {
+                        titleEl.textContent = newName;
+                        titleEl.title = newName;
+                    }
+                }
+                rowMetaCache.delete(row);
+                break;
+            }
+        }
+
+        promptManager.saveServiceSettings?.();
+        scheduleVisibilityUpdate();
+    }, true);
+
+    editSaveBound = true;
 }
 
 /**
@@ -924,11 +1064,12 @@ function attachListObserver() {
  */
 function observePromptManager() {
     patchPromptManager();
+    bindInstantEditSave();
 
     const pmContainer = document.getElementById('completion_prompt_manager');
     if (!pmContainer) return;
 
-    bindDelegatedSectionClick();
+    bindPromptManagerDelegatedClicks();
 
     if (containerObserver) {
         containerObserver.disconnect();
@@ -1362,7 +1503,7 @@ function mountExtensionSettings() {
                 </label>
                 <label class="lpg-check-row" for="lpg-setting-fast-toggle">
                     <input type="checkbox" id="lpg-setting-fast-toggle" />
-                    <span>Toggle rápido sin dry-run de tokens (botón ↻ para recalcular)</span>
+                    <span>Toggle y edición instantáneos sin reconstruir la lista (botón ↻ para tokens)</span>
                 </label>
 
                 <div class="lpg-group-title">Chat y rendimiento móvil</div>
@@ -1455,6 +1596,9 @@ function registerSillyTavernEvents() {
     };
 
     const resetPresetSections = () => {
+        if (!isAiConfigPanelOpen()) {
+            deferredStructureDirty = true;
+        }
         initializedPresetSections = false;
         openSections.clear();
         refresh();
@@ -1470,6 +1614,11 @@ function registerSillyTavernEvents() {
         });
     }
     if (event_types?.CHARACTER_SELECTED) eventSource.on(event_types.CHARACTER_SELECTED, refresh);
+    if (event_types?.CHARACTER_EDITED) {
+        eventSource.on(event_types.CHARACTER_EDITED, () => {
+            if (!isAiConfigPanelOpen()) deferredStructureDirty = true;
+        });
+    }
     if (event_types?.OAI_PRESET_CHANGED_AFTER) eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, resetPresetSections);
     if (event_types?.MAIN_API_CHANGED) eventSource.on(event_types.MAIN_API_CHANGED, resetPresetSections);
 
@@ -1506,5 +1655,6 @@ jQuery(() => {
     setTimeout(() => {
         patchPromptManager();
         patchRegexProvider();
+        bindInstantEditSave();
     }, 1500);
 });
