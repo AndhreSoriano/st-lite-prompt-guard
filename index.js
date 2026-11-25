@@ -1,44 +1,56 @@
 /**
  * Lite Prompt Guard (Mobile)
  *
- * Reemplazo ultraligero de NemoPresetExt optimizado para Android / Brave:
- * 1. Cero reconstrucción del DOM en #completion_prompt_manager_list (solo clase CSS .lpg-hidden).
- * 2. Buscador instantáneo con debounce (120 ms) montado fuera del contenedor que SillyTavern vacía.
- * 3. Botón rápido ON/OFF para Jailbreak / Post-History Instructions usando promptManager.render(false).
- * 4. Escudo CSS anti-rotura para .mes_text que impide desbordamientos y solapamientos en móvil.
+ * Optimizador ultraligero de NemoEngine y Prompt Manager para SillyTavern en Termux / Android / Brave:
+ * 1. Cero reconstrucción del DOM en #completion_prompt_manager_list (solo clases CSS y ::before/::after).
+ * 2. Secciones colapsables para divisores de Nemo (===, ⭐─, ━) y jerarquía visual para subcabeceras (<...>).
+ * 3. Barra compacta persistente (fuera del contenedor que SillyTavern vacía) con buscador con debounce,
+ *    filtro "Solo ON" y botones rápidos para expandir/colapsar todas las secciones.
+ * 4. Escudo CSS anti-rotura para .mes_text en pantallas móviles estrechas.
  */
 
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
-import { promptManager } from '../../../openai.js';
 
 const EXTENSION_KEY = 'lite_prompt_guard';
 const DEFAULT_SETTINGS = Object.freeze({
-    targetPromptName: 'Post-History Instructions',
+    sectionsEnabled: true,
+    startCollapsed: true,
     cssGuardEnabled: true,
 });
 
 const SEARCH_DEBOUNCE_MS = 120;
+const SECTION_DIVIDER_REGEX = /^(=+|⭐─+|━+|─{3,})/;
+const SUBHEADER_REGEX = /^<[^>]+>$/;
 
-/** Caché en memoria de nombres normalizados sin mutar atributos del DOM. */
-const rowLabelCache = new WeakMap();
+/** Caché en memoria de metadatos de cada <li> nativo sin mutar atributos de texto. */
+const rowMetaCache = new WeakMap();
 
+/** Secciones actualmente expandidas en memoria (sobreviven a re-renders nativos). */
+const openSections = new Set();
+
+let initializedPresetSections = false;
+let onlyActiveFilter = false;
 let searchDebounceTimer = null;
-let filterFrameId = null;
+let visibilityFrameId = null;
 let containerObserver = null;
 let listObserver = null;
+let sectionClickBound = false;
 
 /**
  * Inicializa y devuelve la configuración persistente de la extensión.
- * @returns {{ targetPromptName: string, cssGuardEnabled: boolean }}
+ * @returns {{ sectionsEnabled: boolean, startCollapsed: boolean, cssGuardEnabled: boolean }}
  */
 function getSettings() {
     if (!extension_settings[EXTENSION_KEY] || typeof extension_settings[EXTENSION_KEY] !== 'object') {
         extension_settings[EXTENSION_KEY] = { ...DEFAULT_SETTINGS };
     }
     const settings = extension_settings[EXTENSION_KEY];
-    if (typeof settings.targetPromptName !== 'string' || !settings.targetPromptName.trim()) {
-        settings.targetPromptName = DEFAULT_SETTINGS.targetPromptName;
+    if (typeof settings.sectionsEnabled !== 'boolean') {
+        settings.sectionsEnabled = DEFAULT_SETTINGS.sectionsEnabled;
+    }
+    if (typeof settings.startCollapsed !== 'boolean') {
+        settings.startCollapsed = DEFAULT_SETTINGS.startCollapsed;
     }
     if (typeof settings.cssGuardEnabled !== 'boolean') {
         settings.cssGuardEnabled = DEFAULT_SETTINGS.cssGuardEnabled;
@@ -47,8 +59,8 @@ function getSettings() {
 }
 
 /**
- * Inyecta los estilos mínimos para el buscador, el botón rápido y la clase oculta.
- * No toca la estructura ni el layout del Prompt Manager nativo.
+ * Inyecta los estilos mínimos para la barra compacta, secciones colapsables de Nemo y .lpg-hidden.
+ * Mantiene intacta la estructura <li> nativa de #completion_prompt_manager_list.
  */
 function injectBaseStyles() {
     if (document.getElementById('lpg-ui-styles')) return;
@@ -56,16 +68,16 @@ function injectBaseStyles() {
     const style = document.createElement('style');
     style.id = 'lpg-ui-styles';
     style.textContent = `
-        /* Ocultamiento puro por CSS: cero reordenamiento ni eliminación de nodos */
+        /* Ocultamiento puro por CSS: cero eliminación o movimiento de nodos */
         #completion_prompt_manager_list > .completion_prompt_manager_prompt.lpg-hidden {
             display: none !important;
         }
 
-        /* Buscador compacto en la parte superior del Prompt Manager */
-        #lpg-search-wrapper {
+        /* Barra compacta encima de #completion_prompt_manager */
+        #lpg-toolbar {
             display: flex;
             align-items: center;
-            gap: 6px;
+            gap: 5px;
             margin: 6px 0 8px 0;
             width: 100%;
             box-sizing: border-box;
@@ -75,95 +87,93 @@ function injectBaseStyles() {
             flex: 1 1 auto;
             min-width: 0;
             height: 32px;
-            padding: 4px 10px;
+            padding: 4px 8px;
             font-size: 13px;
             box-sizing: border-box;
         }
 
-        #lpg-search-clear {
+        #lpg-search-count {
             flex: 0 0 auto;
-            min-width: 28px;
+            font-size: 11px;
+            opacity: 0.78;
+            white-space: nowrap;
+        }
+
+        #lpg-toolbar .lpg-tool-btn {
+            flex: 0 0 auto;
             height: 30px;
-            padding: 0 8px;
+            min-width: 28px;
+            padding: 0 7px;
+            font-size: 11px;
+            font-weight: 600;
             line-height: 28px;
             text-align: center;
             cursor: pointer;
-            opacity: 0.8;
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
         }
 
         #lpg-search-clear.lpg-empty {
             display: none;
         }
 
-        #lpg-search-count {
-            flex: 0 0 auto;
-            font-size: 11px;
-            opacity: 0.75;
+        #lpg-only-active.lpg-active {
+            border-color: rgba(76, 175, 80, 0.8);
+            background: rgba(76, 175, 80, 0.18);
+        }
+
+        #lpg-toolbar.lpg-no-sections .lpg-sec-btn {
+            display: none;
+        }
+
+        /* Cabeceras de sección de Nemo (===, ⭐─, ━) sin reconstruir el <li> */
+        #completion_prompt_manager_list > .completion_prompt_manager_prompt.lpg-section {
+            background: var(--SmartThemeBlurTintColor, rgba(255, 255, 255, 0.06));
+            border-left: 3px solid var(--SmartThemeQuoteColor, #7aa2f7);
+            border-radius: 4px;
+            margin-top: 6px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        #completion_prompt_manager_list > .completion_prompt_manager_prompt.lpg-section .completion_prompt_manager_prompt_name::before {
+            content: '▸ ';
+            display: inline-block;
+            opacity: 0.85;
+            margin-right: 3px;
+        }
+
+        #completion_prompt_manager_list > .completion_prompt_manager_prompt.lpg-section.lpg-open .completion_prompt_manager_prompt_name::before {
+            content: '▾ ';
+        }
+
+        #completion_prompt_manager_list > .completion_prompt_manager_prompt.lpg-section[data-lpg-badge]::after {
+            content: attr(data-lpg-badge);
+            font-size: 10px;
+            font-weight: 600;
+            opacity: 0.78;
+            padding: 1px 5px;
+            border-radius: 9px;
+            border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
+            margin-left: 6px;
+            align-self: center;
             white-space: nowrap;
         }
 
-        /* Botón discreto de acceso rápido en barra superior o área de envío */
-        #lpg-jb-holder {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            flex: 0 0 auto;
+        /* Subcabeceras <Core: ...> de Nemo */
+        #completion_prompt_manager_list > .completion_prompt_manager_prompt.lpg-subheader {
+            opacity: 0.88;
+            font-size: 0.92em;
+            border-left: 2px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.25));
+            margin-top: 4px;
         }
 
-        #lpg-jb-btn {
-            display: inline-flex;
-            align-items: center;
-            gap: 5px;
-            height: 28px;
-            padding: 0 8px;
-            border-radius: 6px;
-            border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
-            background: var(--SmartThemeBlurTintColor, rgba(0, 0, 0, 0.25));
-            color: var(--SmartThemeBodyColor, #eee);
-            font-size: 11px;
-            font-weight: 600;
-            line-height: 1;
-            cursor: pointer;
-            user-select: none;
-            -webkit-tap-highlight-color: transparent;
-        }
-
-        #lpg-jb-btn .lpg-jb-dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            flex-shrink: 0;
-            background: #888;
-        }
-
-        #lpg-jb-btn.lpg-on {
-            border-color: rgba(76, 175, 80, 0.75);
-            background: rgba(76, 175, 80, 0.16);
-        }
-
-        #lpg-jb-btn.lpg-on .lpg-jb-dot {
-            background: #4caf50;
-            box-shadow: 0 0 6px rgba(76, 175, 80, 0.8);
-        }
-
-        #lpg-jb-btn.lpg-off {
-            border-color: rgba(244, 67, 54, 0.55);
-            background: rgba(244, 67, 54, 0.1);
-        }
-
-        #lpg-jb-btn.lpg-off .lpg-jb-dot {
-            background: #f44336;
-        }
-
-        #lpg-jb-btn.lpg-na {
-            opacity: 0.45;
-        }
-
-        #lpg-settings-panel .lpg-field {
+        #lpg-settings-panel .lpg-check-row {
             display: flex;
-            flex-direction: column;
-            gap: 4px;
-            margin-bottom: 10px;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+            cursor: pointer;
         }
     `;
     document.head.appendChild(style);
@@ -253,121 +263,294 @@ function syncChatCssGuard() {
 }
 
 /**
- * Obtiene y cachea el texto buscable (nombre + identificador) de una fila nativa del Prompt Manager.
+ * Lee y cachea nombre, texto buscable y tipo de fila (sección/subcabecera) para un <li> nativo.
  * @param {HTMLElement} row
- * @returns {string}
+ * @param {number} index
+ * @returns {{ id: string, searchText: string, isSection: boolean, isSubheader: boolean }}
  */
-function getRowSearchText(row) {
-    let cached = rowLabelCache.get(row);
+function getRowMeta(row, index) {
+    let cached = rowMetaCache.get(row);
     if (cached !== undefined) return cached;
 
     const nameEl = row.querySelector('.completion_prompt_manager_prompt_name');
-    const rawName = nameEl?.dataset?.pmName || nameEl?.textContent || '';
-    const identifier = row.dataset?.pmIdentifier || '';
-    cached = `${rawName} ${identifier}`.toLowerCase().trim();
-    rowLabelCache.set(row, cached);
+    const rawName = (nameEl?.dataset?.pmName || nameEl?.textContent || '').trim();
+    const identifier = (row.dataset?.pmIdentifier || '').trim();
+    const isSection = SECTION_DIVIDER_REGEX.test(rawName);
+    const isSubheader = !isSection && SUBHEADER_REGEX.test(rawName);
+
+    cached = {
+        id: identifier || `lpg-row-${index}`,
+        searchText: `${rawName} ${identifier}`.toLowerCase(),
+        isSection,
+        isSubheader,
+    };
+    rowMetaCache.set(row, cached);
     return cached;
 }
 
 /**
- * Programa el filtrado de prompts en un único requestAnimationFrame para evitar layout thrashing.
+ * Programa el cálculo de secciones y visibilidad en un único requestAnimationFrame.
  */
-function schedulePromptFilter() {
-    if (filterFrameId !== null) {
-        cancelAnimationFrame(filterFrameId);
+function scheduleVisibilityUpdate() {
+    if (visibilityFrameId !== null) {
+        cancelAnimationFrame(visibilityFrameId);
     }
-    filterFrameId = requestAnimationFrame(() => {
-        filterFrameId = null;
-        applyPromptFilterNow();
+    visibilityFrameId = requestAnimationFrame(() => {
+        visibilityFrameId = null;
+        applyVisibilityNow();
     });
 }
 
 /**
- * Filtra las filas nativas existentes aplicando o quitando únicamente la clase .lpg-hidden.
+ * Agrupa visualmente las secciones de Nemo y aplica los filtros sin mover ni clonar nodos del DOM.
  */
-function applyPromptFilterNow() {
+function applyVisibilityNow() {
+    const settings = getSettings();
+    const toolbar = document.getElementById('lpg-toolbar');
     const input = document.getElementById('lpg-prompt-search');
     const clearBtn = document.getElementById('lpg-search-clear');
     const countEl = document.getElementById('lpg-search-count');
+    const activeBtn = document.getElementById('lpg-only-active');
     const listEl = document.getElementById('completion_prompt_manager_list');
 
     const query = (input?.value || '').trim().toLowerCase();
+    const isFiltered = query.length > 0 || onlyActiveFilter;
 
     if (clearBtn) {
         clearBtn.classList.toggle('lpg-empty', query.length === 0);
     }
+    if (activeBtn) {
+        activeBtn.classList.toggle('lpg-active', onlyActiveFilter);
+        activeBtn.setAttribute('aria-pressed', String(onlyActiveFilter));
+    }
 
     if (!listEl) {
         if (countEl) countEl.textContent = '';
+        if (toolbar) toolbar.classList.add('lpg-no-sections');
         return;
     }
 
     const rows = listEl.querySelectorAll(':scope > .completion_prompt_manager_prompt');
-    let visibleCount = 0;
+    const rowInfo = new Array(rows.length);
+    const sections = [];
+    const subheaders = [];
 
+    let currentSection = null;
+    let currentSubheader = null;
+
+    // Pasada 1: clasificar filas y contar módulos activos/totales por sección
     for (let i = 0; i < rows.length; i++) {
         const row = rows[i];
-        const shouldHide = query.length > 0 && !getRowSearchText(row).includes(query);
-        const isHidden = row.classList.contains('lpg-hidden');
+        const meta = getRowMeta(row, i);
+        const isEnabled = !row.classList.contains('completion_prompt_manager_prompt_disabled');
 
-        if (isHidden !== shouldHide) {
-            row.classList.toggle('lpg-hidden', shouldHide);
+        if (meta.isSection && settings.sectionsEnabled) {
+            currentSection = {
+                id: meta.id,
+                headerIndex: i,
+                row,
+                total: 0,
+                active: 0,
+                hasVisibleChild: false,
+            };
+            sections.push(currentSection);
+            currentSubheader = null;
+            rowInfo[i] = { meta, section: currentSection, subheader: null, isEnabled, isSectionHeader: true, isSubheaderRow: false };
+            continue;
         }
-        if (!shouldHide) {
-            visibleCount++;
+
+        if (meta.isSubheader && settings.sectionsEnabled) {
+            currentSubheader = {
+                index: i,
+                row,
+                section: currentSection,
+                hasVisibleChild: false,
+            };
+            subheaders.push(currentSubheader);
+            rowInfo[i] = { meta, section: currentSection, subheader: currentSubheader, isEnabled, isSectionHeader: false, isSubheaderRow: true };
+            continue;
+        }
+
+        if (currentSection) {
+            currentSection.total++;
+            if (isEnabled) currentSection.active++;
+        }
+
+        rowInfo[i] = { meta, section: currentSection, subheader: currentSubheader, isEnabled, isSectionHeader: false, isSubheaderRow: false };
+    }
+
+    if (toolbar) {
+        toolbar.classList.toggle('lpg-no-sections', !settings.sectionsEnabled || sections.length === 0);
+    }
+
+    if (!initializedPresetSections && sections.length > 0) {
+        if (!settings.startCollapsed) {
+            for (const sec of sections) openSections.add(sec.id);
+        }
+        initializedPresetSections = true;
+    }
+
+    // Pasada 2: determinar visibilidad de módulos hoja y propagar a cabeceras cuando hay filtro
+    const shouldHide = new Array(rows.length).fill(false);
+    let totalLeafPrompts = 0;
+    let visibleLeafPrompts = 0;
+
+    for (let i = 0; i < rows.length; i++) {
+        const info = rowInfo[i];
+        if (info.isSectionHeader || info.isSubheaderRow) continue;
+
+        totalLeafPrompts++;
+        let hide = false;
+
+        if (isFiltered) {
+            const matchesActive = !onlyActiveFilter || info.isEnabled;
+            const matchesQuery = query.length === 0 || info.meta.searchText.includes(query);
+            hide = !(matchesActive && matchesQuery);
+        } else if (settings.sectionsEnabled && info.section) {
+            hide = !openSections.has(info.section.id);
+        }
+
+        shouldHide[i] = hide;
+        if (!hide) {
+            visibleLeafPrompts++;
+            if (info.section) info.section.hasVisibleChild = true;
+            if (info.subheader) info.subheader.hasVisibleChild = true;
+        }
+    }
+
+    // Visibilidad de subcabeceras (<...>) y secciones (===)
+    for (const sub of subheaders) {
+        const info = rowInfo[sub.index];
+        if (isFiltered) {
+            const selfMatches = !onlyActiveFilter && query.length > 0 && info.meta.searchText.includes(query);
+            shouldHide[sub.index] = !(sub.hasVisibleChild || selfMatches);
+        } else if (settings.sectionsEnabled && info.section) {
+            shouldHide[sub.index] = !openSections.has(info.section.id);
+        }
+    }
+
+    for (const sec of sections) {
+        const info = rowInfo[sec.headerIndex];
+        if (isFiltered) {
+            const selfMatches = !onlyActiveFilter && query.length > 0 && info.meta.searchText.includes(query);
+            shouldHide[sec.headerIndex] = !(sec.hasVisibleChild || selfMatches);
+        } else {
+            shouldHide[sec.headerIndex] = false;
+        }
+    }
+
+    // Pasada 3: aplicar únicamente diferencias mínimas de clases/atributos al DOM
+    for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const info = rowInfo[i];
+
+        if (row.classList.contains('lpg-section') !== info.isSectionHeader) {
+            row.classList.toggle('lpg-section', info.isSectionHeader);
+        }
+        if (row.classList.contains('lpg-subheader') !== info.isSubheaderRow) {
+            row.classList.toggle('lpg-subheader', info.isSubheaderRow);
+        }
+
+        if (info.isSectionHeader) {
+            const isOpen = isFiltered || openSections.has(info.section.id);
+            if (row.classList.contains('lpg-open') !== isOpen) {
+                row.classList.toggle('lpg-open', isOpen);
+            }
+            const badge = `${info.section.active}/${info.section.total}`;
+            if (row.getAttribute('data-lpg-badge') !== badge) {
+                row.setAttribute('data-lpg-badge', badge);
+            }
+        } else {
+            if (row.classList.contains('lpg-open')) row.classList.remove('lpg-open');
+            if (row.hasAttribute('data-lpg-badge')) row.removeAttribute('data-lpg-badge');
+        }
+
+        const hide = shouldHide[i];
+        if (row.classList.contains('lpg-hidden') !== hide) {
+            row.classList.toggle('lpg-hidden', hide);
         }
     }
 
     if (countEl) {
-        countEl.textContent = query.length > 0 ? `${visibleCount}/${rows.length}` : '';
+        countEl.textContent = isFiltered ? `${visibleLeafPrompts}/${totalLeafPrompts}` : '';
     }
 }
 
 /**
- * Monta un único <input type="text"> inmediatamente ANTES de #completion_prompt_manager.
- * Montarlo como hermano evita que PromptManager.renderPromptManager() (innerHTML = '') lo destruya
- * o cierre el teclado móvil al pulsar toggles.
+ * Expande o colapsa todas las secciones detectadas de Nemo en un solo clic.
+ * @param {boolean} expand
  */
-function mountPromptSearch() {
-    if (document.getElementById('lpg-search-wrapper')) return;
+function setAllSectionsOpen(expand) {
+    if (!expand) {
+        openSections.clear();
+        scheduleVisibilityUpdate();
+        return;
+    }
+
+    const listEl = document.getElementById('completion_prompt_manager_list');
+    if (!listEl) return;
+
+    const rows = listEl.querySelectorAll(':scope > .completion_prompt_manager_prompt');
+    for (let i = 0; i < rows.length; i++) {
+        const meta = getRowMeta(rows[i], i);
+        if (meta.isSection) {
+            openSections.add(meta.id);
+        }
+    }
+    scheduleVisibilityUpdate();
+}
+
+/**
+ * Monta la barra compacta (buscador + Solo ON + expandir/colapsar) ANTES de #completion_prompt_manager.
+ * Al vivir fuera del contenedor que SillyTavern vacía con innerHTML = '', no pierde el foco ni cierra el teclado.
+ */
+function mountToolbar() {
+    if (document.getElementById('lpg-toolbar')) return;
 
     const pmContainer = document.getElementById('completion_prompt_manager');
     if (!pmContainer || !pmContainer.parentElement) return;
 
-    const wrapper = document.createElement('div');
-    wrapper.id = 'lpg-search-wrapper';
-    wrapper.innerHTML = `
+    const toolbar = document.createElement('div');
+    toolbar.id = 'lpg-toolbar';
+    toolbar.className = 'lpg-no-sections';
+    toolbar.innerHTML = `
         <input
             type="text"
             id="lpg-prompt-search"
             class="text_pole"
-            placeholder="Filtrar prompts..."
+            placeholder="Buscar módulo Nemo..."
             autocomplete="off"
             autocorrect="off"
             autocapitalize="off"
             spellcheck="false"
-            aria-label="Filtrar prompts del Prompt Manager"
+            aria-label="Buscar en Prompt Manager"
         />
         <span id="lpg-search-count" aria-live="polite"></span>
-        <button type="button" id="lpg-search-clear" class="menu_button lpg-empty" title="Limpiar búsqueda" aria-label="Limpiar búsqueda">&times;</button>
+        <button type="button" id="lpg-search-clear" class="menu_button lpg-tool-btn lpg-empty" title="Limpiar búsqueda" aria-label="Limpiar búsqueda">&times;</button>
+        <button type="button" id="lpg-only-active" class="menu_button lpg-tool-btn" aria-pressed="false" title="Mostrar solo prompts activos">Solo ON</button>
+        <button type="button" id="lpg-expand-all" class="menu_button lpg-tool-btn lpg-sec-btn" title="Expandir todas las secciones" aria-label="Expandir secciones">+</button>
+        <button type="button" id="lpg-collapse-all" class="menu_button lpg-tool-btn lpg-sec-btn" title="Colapsar todas las secciones" aria-label="Colapsar secciones">&minus;</button>
     `;
 
-    pmContainer.parentElement.insertBefore(wrapper, pmContainer);
+    pmContainer.parentElement.insertBefore(toolbar, pmContainer);
 
-    const input = wrapper.querySelector('#lpg-prompt-search');
-    const clearBtn = wrapper.querySelector('#lpg-search-clear');
+    const input = toolbar.querySelector('#lpg-prompt-search');
+    const clearBtn = toolbar.querySelector('#lpg-search-clear');
+    const activeBtn = toolbar.querySelector('#lpg-only-active');
+    const expandBtn = toolbar.querySelector('#lpg-expand-all');
+    const collapseBtn = toolbar.querySelector('#lpg-collapse-all');
 
     input.addEventListener('input', () => {
         if (searchDebounceTimer !== null) {
             clearTimeout(searchDebounceTimer);
         }
         if (!input.value.trim()) {
-            schedulePromptFilter();
+            scheduleVisibilityUpdate();
             return;
         }
         searchDebounceTimer = setTimeout(() => {
             searchDebounceTimer = null;
-            schedulePromptFilter();
+            scheduleVisibilityUpdate();
         }, SEARCH_DEBOUNCE_MS);
     });
 
@@ -375,20 +558,65 @@ function mountPromptSearch() {
         if (event.key === 'Escape' && input.value) {
             event.stopPropagation();
             input.value = '';
-            schedulePromptFilter();
+            scheduleVisibilityUpdate();
         }
     });
 
     clearBtn.addEventListener('click', () => {
         input.value = '';
-        schedulePromptFilter();
+        scheduleVisibilityUpdate();
         input.focus();
     });
+
+    activeBtn.addEventListener('click', () => {
+        onlyActiveFilter = !onlyActiveFilter;
+        scheduleVisibilityUpdate();
+    });
+
+    expandBtn.addEventListener('click', () => setAllSectionsOpen(true));
+    collapseBtn.addEventListener('click', () => setAllSectionsOpen(false));
+}
+
+/**
+ * Registra un único listener delegado (fase de captura) en #completion_prompt_manager
+ * para abrir/cerrar secciones de Nemo sin abrir el modal de inspección nativo.
+ */
+function bindDelegatedSectionClick() {
+    if (sectionClickBound) return;
+
+    const pmContainer = document.getElementById('completion_prompt_manager');
+    if (!pmContainer) return;
+
+    pmContainer.addEventListener('click', (event) => {
+        if (!getSettings().sectionsEnabled) return;
+
+        const target = event.target instanceof Element ? event.target : null;
+        if (!target) return;
+
+        const sectionRow = target.closest('.completion_prompt_manager_prompt.lpg-section');
+        if (!sectionRow) return;
+
+        // Respetar controles nativos (toggle, editar, quitar, arrastrar)
+        if (target.closest('.prompt_manager_prompt_controls, .drag-handle')) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        const meta = getRowMeta(sectionRow, 0);
+        if (openSections.has(meta.id)) {
+            openSections.delete(meta.id);
+        } else {
+            openSections.add(meta.id);
+        }
+        scheduleVisibilityUpdate();
+    }, true);
+
+    sectionClickBound = true;
 }
 
 /**
  * Conecta un observador superficial (subtree: false) a #completion_prompt_manager_list
- * para re-aplicar el filtro cuando SillyTavern reconstruya la lista nativa.
+ * para re-aplicar secciones y filtros tras cada render nativo de SillyTavern.
  */
 function attachListObserver() {
     if (listObserver) {
@@ -400,12 +628,11 @@ function attachListObserver() {
     if (!listEl) return;
 
     listObserver = new MutationObserver(() => {
-        schedulePromptFilter();
-        syncQuickToggleUI();
+        scheduleVisibilityUpdate();
     });
     listObserver.observe(listEl, { childList: true, subtree: false });
 
-    schedulePromptFilter();
+    scheduleVisibilityUpdate();
 }
 
 /**
@@ -415,6 +642,8 @@ function observePromptManager() {
     const pmContainer = document.getElementById('completion_prompt_manager');
     if (!pmContainer) return;
 
+    bindDelegatedSectionClick();
+
     if (containerObserver) {
         containerObserver.disconnect();
         containerObserver = null;
@@ -422,7 +651,6 @@ function observePromptManager() {
 
     containerObserver = new MutationObserver(() => {
         attachListObserver();
-        syncQuickToggleUI();
     });
     containerObserver.observe(pmContainer, { childList: true, subtree: false });
 
@@ -430,145 +658,7 @@ function observePromptManager() {
 }
 
 /**
- * Busca el bloque objetivo configurado dentro del PromptManager activo.
- * @returns {{ prompt: object, orderEntry: object } | null}
- */
-function findTargetPrompt() {
-    if (!promptManager || !promptManager.activeCharacter) return null;
-    const prompts = promptManager.serviceSettings?.prompts;
-    if (!Array.isArray(prompts) || prompts.length === 0) return null;
-
-    const target = getSettings().targetPromptName.trim().toLowerCase();
-    if (!target) return null;
-
-    // 1. Coincidencia exacta por nombre o identificador (solo si está en el orden del personaje)
-    for (const prompt of prompts) {
-        if (!prompt) continue;
-        const name = (prompt.name || '').trim().toLowerCase();
-        const id = (prompt.identifier || '').trim().toLowerCase();
-        if (name === target || id === target) {
-            const orderEntry = promptManager.getPromptOrderEntry(promptManager.activeCharacter, prompt.identifier);
-            if (orderEntry) return { prompt, orderEntry };
-        }
-    }
-
-    // 2. Coincidencia parcial por nombre
-    for (const prompt of prompts) {
-        if (!prompt) continue;
-        const name = (prompt.name || '').trim().toLowerCase();
-        if (name.includes(target)) {
-            const orderEntry = promptManager.getPromptOrderEntry(promptManager.activeCharacter, prompt.identifier);
-            if (orderEntry) return { prompt, orderEntry };
-        }
-    }
-
-    // 3. Respaldo al identificador nativo 'jailbreak' cuando se busca el bloque estándar
-    if (target === 'post-history instructions' || target === 'jailbreak') {
-        const jbPrompt = prompts.find((p) => p && p.identifier === 'jailbreak');
-        if (jbPrompt) {
-            const orderEntry = promptManager.getPromptOrderEntry(promptManager.activeCharacter, jbPrompt.identifier);
-            if (orderEntry) return { prompt: jbPrompt, orderEntry };
-        }
-    }
-
-    return null;
-}
-
-/**
- * Actualiza el aspecto visual (ON / OFF / N/A) del botón de acceso rápido.
- */
-function syncQuickToggleUI() {
-    const btn = document.getElementById('lpg-jb-btn');
-    if (!btn) return;
-
-    const labelEl = btn.querySelector('.lpg-jb-label');
-    const match = findTargetPrompt();
-
-    btn.classList.remove('lpg-on', 'lpg-off', 'lpg-na');
-
-    if (!match) {
-        btn.classList.add('lpg-na');
-        btn.setAttribute('aria-pressed', 'false');
-        btn.title = `Bloque "${getSettings().targetPromptName}" no disponible en el preset/API actual`;
-        if (labelEl) labelEl.textContent = 'JB: N/A';
-        return;
-    }
-
-    const enabled = Boolean(match.orderEntry.enabled);
-    btn.classList.add(enabled ? 'lpg-on' : 'lpg-off');
-    btn.setAttribute('aria-pressed', String(enabled));
-    btn.title = `${match.prompt.name || match.prompt.identifier}: ${enabled ? 'ACTIVADO' : 'DESACTIVADO'} (clic para alternar)`;
-    if (labelEl) labelEl.textContent = enabled ? 'JB: ON' : 'JB: OFF';
-}
-
-/**
- * Alterna el bloque objetivo con un clic y evita el dry-run pesado usando render(false).
- */
-function toggleTargetPrompt() {
-    const match = findTargetPrompt();
-    if (!match) {
-        if (window.toastr) {
-            window.toastr.warning(
-                `No se encontró "${getSettings().targetPromptName}" en el preset actual (requiere Chat Completion).`,
-                'Lite Prompt Guard',
-            );
-        }
-        syncQuickToggleUI();
-        return;
-    }
-
-    const { prompt, orderEntry } = match;
-    const counts = promptManager.tokenHandler?.getCounts?.();
-    if (counts) {
-        counts[prompt.identifier] = null;
-    }
-
-    orderEntry.enabled = !orderEntry.enabled;
-
-    // render(false) sincroniza la UI del Prompt Manager sin disparar tryGenerate() en móvil
-    promptManager.render(false);
-    promptManager.saveServiceSettings();
-
-    syncQuickToggleUI();
-
-    if (window.toastr) {
-        const stateText = orderEntry.enabled ? 'activado' : 'desactivado';
-        window.toastr.info(`${prompt.name || prompt.identifier} ${stateText}.`, 'Lite Prompt Guard', { timeOut: 1500 });
-    }
-}
-
-/**
- * Monta el botón rápido en la barra superior (#top-settings-holder) o encima del input (#nonQRFormItems).
- */
-function mountQuickToggleButton() {
-    if (document.getElementById('lpg-jb-btn')) return;
-
-    const topBar = document.getElementById('top-settings-holder');
-    const chatTopBar = document.getElementById('nonQRFormItems');
-    const anchor = topBar || chatTopBar;
-    if (!anchor) return;
-
-    const holder = document.createElement('div');
-    holder.id = 'lpg-jb-holder';
-    holder.innerHTML = `
-        <button type="button" id="lpg-jb-btn" class="lpg-na" aria-pressed="false" title="Alternar Jailbreak">
-            <span class="lpg-jb-dot" aria-hidden="true"></span>
-            <span class="lpg-jb-label">JB: N/A</span>
-        </button>
-    `;
-
-    if (topBar) {
-        topBar.appendChild(holder);
-    } else {
-        anchor.prepend(holder);
-    }
-
-    holder.querySelector('#lpg-jb-btn').addEventListener('click', toggleTargetPrompt);
-    syncQuickToggleUI();
-}
-
-/**
- * Añade un panel minimalista en Extensiones para configurar el bloque objetivo y el escudo CSS.
+ * Añade un panel minimalista en Extensiones con las opciones de organización y protección móvil.
  */
 function mountExtensionSettings() {
     if (document.getElementById('lpg-settings-panel')) return;
@@ -587,11 +677,15 @@ function mountExtensionSettings() {
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
-                <div class="lpg-field">
-                    <label for="lpg-setting-target">Nombre del bloque para el botón rápido:</label>
-                    <input type="text" id="lpg-setting-target" class="text_pole" placeholder="Post-History Instructions" />
-                </div>
-                <label class="checkbox_label" for="lpg-setting-css-guard">
+                <label class="lpg-check-row" for="lpg-setting-sections">
+                    <input type="checkbox" id="lpg-setting-sections" />
+                    <span>Agrupar secciones de Nemo (===, ⭐─, ━) colapsables</span>
+                </label>
+                <label class="lpg-check-row" for="lpg-setting-collapsed">
+                    <input type="checkbox" id="lpg-setting-collapsed" />
+                    <span>Iniciar con secciones colapsadas (recomendado en Termux/móvil)</span>
+                </label>
+                <label class="lpg-check-row" for="lpg-setting-css-guard">
                     <input type="checkbox" id="lpg-setting-css-guard" />
                     <span>Activar escudo CSS anti-rotura en mensajes (.mes_text)</span>
                 </label>
@@ -601,16 +695,24 @@ function mountExtensionSettings() {
 
     container.appendChild(wrapper);
 
-    const targetInput = wrapper.querySelector('#lpg-setting-target');
+    const sectionsCheckbox = wrapper.querySelector('#lpg-setting-sections');
+    const collapsedCheckbox = wrapper.querySelector('#lpg-setting-collapsed');
     const cssCheckbox = wrapper.querySelector('#lpg-setting-css-guard');
 
-    targetInput.value = settings.targetPromptName;
+    sectionsCheckbox.checked = settings.sectionsEnabled;
+    collapsedCheckbox.checked = settings.startCollapsed;
     cssCheckbox.checked = settings.cssGuardEnabled;
 
-    targetInput.addEventListener('input', () => {
-        settings.targetPromptName = targetInput.value.trim() || DEFAULT_SETTINGS.targetPromptName;
+    sectionsCheckbox.addEventListener('change', () => {
+        settings.sectionsEnabled = sectionsCheckbox.checked;
         saveSettingsDebounced();
-        syncQuickToggleUI();
+        scheduleVisibilityUpdate();
+    });
+
+    collapsedCheckbox.addEventListener('change', () => {
+        settings.startCollapsed = collapsedCheckbox.checked;
+        saveSettingsDebounced();
+        setAllSectionsOpen(!settings.startCollapsed);
     });
 
     cssCheckbox.addEventListener('change', () => {
@@ -625,25 +727,21 @@ function mountExtensionSettings() {
  */
 function registerSillyTavernEvents() {
     const refresh = () => {
-        mountPromptSearch();
-        mountQuickToggleButton();
+        mountToolbar();
         observePromptManager();
-        syncQuickToggleUI();
     };
 
-    const eventKeys = [
-        'APP_READY',
-        'OAI_PRESET_CHANGED_AFTER',
-        'CHAT_CHANGED',
-        'CHARACTER_SELECTED',
-        'MAIN_API_CHANGED',
-    ];
+    const resetPresetSections = () => {
+        initializedPresetSections = false;
+        openSections.clear();
+        refresh();
+    };
 
-    for (const key of eventKeys) {
-        if (event_types && event_types[key]) {
-            eventSource.on(event_types[key], refresh);
-        }
-    }
+    if (event_types?.APP_READY) eventSource.on(event_types.APP_READY, refresh);
+    if (event_types?.CHAT_CHANGED) eventSource.on(event_types.CHAT_CHANGED, refresh);
+    if (event_types?.CHARACTER_SELECTED) eventSource.on(event_types.CHARACTER_SELECTED, refresh);
+    if (event_types?.OAI_PRESET_CHANGED_AFTER) eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, resetPresetSections);
+    if (event_types?.MAIN_API_CHANGED) eventSource.on(event_types.MAIN_API_CHANGED, resetPresetSections);
 }
 
 jQuery(() => {
@@ -651,9 +749,7 @@ jQuery(() => {
     injectBaseStyles();
     syncChatCssGuard();
     mountExtensionSettings();
-    mountPromptSearch();
-    mountQuickToggleButton();
+    mountToolbar();
     observePromptManager();
     registerSillyTavernEvents();
-    syncQuickToggleUI();
 });
