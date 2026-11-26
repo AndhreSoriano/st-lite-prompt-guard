@@ -1,18 +1,16 @@
 /**
- * Lite Prompt Guard (Mobile) v1.6.0
+ * Lite Prompt Guard (Mobile) v1.7.0
  *
- * Optimizador ultraligero para SillyTavern + NemoEngine en Termux / Android / Brave:
- * 1. Cero reconstrucción del DOM en #completion_prompt_manager_list (solo clases CSS y ::before/::after).
- * 2. Toggle O(1) (<0.1 ms) y apertura de secciones O(sección): índice en memoria sin re-escanear
- *    los 600+ nodos en cada clic ni mutar el DOM de filas no afectadas.
- * 3. jQuery UI .sortable() + touch-punch desactivados por defecto (botón ⇅ en barra para reordenar
- *    bajo demanda), evitando escaneos Sizzle y cálculos de posición en cada toque.
- * 4. Persistencia inteligente en reposo (coalesced idle save): evita congelamientos por
- *    JSON.stringify + /api/settings/save 1 s después de cada toggle, con volcado inmediato al cerrar
- *    el panel, enviar mensaje, cambiar preset o ocultar/cerrar la pestaña.
- * 5. Aislamiento CSS (contain: layout style paint) y eliminación de drop-shadow/transiciones en iconos.
- * 6. Render Guard: pospone re-renders ocultos y abre #left-nav-panel en 0 ms.
- * 7. Acelerador automático de Regex (pre-filtro literal 40x+ más rápido) y mejoras móviles.
+ * Optimizador ultraligero global para SillyTavern en Termux / Android / Brave (cualquier preset):
+ * 1. Prompt Manager (cualquier preset): cero reconstrucción del DOM, toggle O(1) (<0.1 ms),
+ *    apertura de secciones O(sección) para divisores universales (===, ---, ***, ═══, ━, ───),
+ *    sortable()/touch-punch desactivados por defecto (botón ⇅) y persistencia inteligente en reposo.
+ * 2. Streaming Ligero + Acelerador de Regex (Global / Personaje / Preset): pospone Regex visuales
+ *    pesados durante el streaming y los aplica una sola vez al terminar; pre-filtro literal O(1)
+ *    sin desactivar ningún script.
+ * 3. Virtualización CSS global (chat, personajes, lorebooks, grupos, avatares y listas regex),
+ *    Modo GPU Lite con pausa de animaciones @keyframes en mensajes antiguos, lazy images,
+ *    auto-colapso de thinking, Render Guard y escudo CSS en .mes_text.
  */
 
 import * as stScript from '../../../../script.js';
@@ -36,16 +34,18 @@ const DEFAULT_SETTINGS = Object.freeze({
     autoCollapseReasoning: true,
     cssGuardEnabled: true,
     regexPrefilterEnabled: true,
+    streamLiteEnabled: true,
 });
 
 const SEARCH_DEBOUNCE_MS = 120;
 const RENDER_DEBOUNCE_MS = 250;
 const SMART_SAVE_IDLE_MS = 3500;
 const SMART_SAVE_MAX_WAIT_MS = 15000;
-const SECTION_DIVIDER_REGEX = /^(=+|⭐─+|━+|─{3,})/;
+const SECTION_DIVIDER_REGEX = /^(?:={2,}|-{3,}|\*{3,}|_{3,}|═{2,}|━+|─{3,}|[~～]{3,}|[┌┏╔][─━═]+|(?:[⭐★☆✦✧◈◆❖▶▸•§]|[\u{1F300}-\u{1FAFF}])\s*[─━═=-]{2,})/u;
 const SUBHEADER_REGEX = /^<[^>]+>$/;
 const HEAVY_NEMO_REGEX_PATTERN = /\b(mental\s*projection|magpie|tracker\s*ui|emoji\s*fx|nemo\s*mp)\b/i;
 const CORE_RUNTIME_REGEX_PATTERN = /\b(nemo\s*runtime|nemo\s*story|nemo\s*commands)\b/i;
+const HEAVY_HTML_OUTPUT_REGEX = /<(?:style|table|svg|iframe|canvas|details)\b|@keyframes|animation\s*:|backdrop-filter\s*:/i;
 
 let cachedRegexEngine = undefined;
 
@@ -59,6 +59,7 @@ const patchedPromptManagers = new WeakSet();
 const patchedRegexProviders = new WeakSet();
 const patchedRegexes = new WeakSet();
 const requiredLiteralCache = new Map();
+const heavyStreamRegexSources = new Set();
 
 /** Secciones actualmente expandidas en memoria (sobreviven a re-renders nativos). */
 const openSections = new Set();
@@ -79,6 +80,9 @@ let origMakeDraggableRef = null;
 let deferredStructureDirty = false;
 let forceFullRender = false;
 let regexSkippedCount = 0;
+let streamSkippedCount = 0;
+let isActivelyStreaming = false;
+let streamDeferredHit = false;
 let lastLowerSrc = '';
 let lastLowerVal = '';
 
@@ -97,7 +101,7 @@ let containerObserver = null;
 let listObserver = null;
 let drawerObserver = null;
 let chatObserver = null;
-let charListObserver = null;
+const lazyObservers = new Map();
 let sectionClickBound = false;
 let editSaveBound = false;
 let panelActivityBound = false;
@@ -321,7 +325,7 @@ function injectBaseStyles() {
 }
 
 /**
- * Evita pintar y calcular layout de mensajes y tarjetas de personajes fuera de pantalla.
+ * Evita pintar y calcular layout de listas y mensajes fuera de pantalla en todo SillyTavern.
  */
 function syncContentVisibility() {
     syncManagedStyle('lpg-cv-styles', getSettings().contentVisibilityEnabled, `
@@ -330,15 +334,34 @@ function syncContentVisibility() {
             contain-intrinsic-size: auto 220px;
         }
 
-        #rm_print_characters_block .character_select {
+        #rm_print_characters_block .character_select,
+        #rm_group_add_members .character_select {
             content-visibility: auto;
             contain-intrinsic-size: auto 72px;
+        }
+
+        #world_popup_entries_list .world_entry {
+            content-visibility: auto;
+            contain-intrinsic-size: auto 56px;
+        }
+
+        #user_avatar_block .avatar-container {
+            content-visibility: auto;
+            contain-intrinsic-size: auto 90px;
+        }
+
+        #saved_regex_scripts .regex-script-label,
+        #saved_scoped_scripts .regex-script-label,
+        #saved_preset_scripts .regex-script-label {
+            content-visibility: auto;
+            contain-intrinsic-size: auto 40px;
         }
     `);
 }
 
 /**
- * Desactiva efectos pesados de GPU móvil (backdrop-filter blur, sombras y transiciones UI).
+ * Desactiva efectos pesados de GPU móvil (backdrop-filter blur, sombras, transiciones UI)
+ * y pausa animaciones CSS (@keyframes) infinitas en mensajes antiguos.
  */
 function syncGpuLite() {
     syncManagedStyle('lpg-gpu-lite-styles', getSettings().gpuLiteEnabled, `
@@ -351,7 +374,10 @@ function syncGpuLite() {
         .popup,
         .shadow_popup,
         .dialogue_popup,
-        .inline-drawer-content {
+        .inline-drawer-content,
+        .character_select,
+        .world_entry,
+        .avatar {
             backdrop-filter: none !important;
             -webkit-backdrop-filter: none !important;
             box-shadow: none !important;
@@ -361,6 +387,14 @@ function syncGpuLite() {
         .drawer-content,
         .mes {
             text-shadow: none !important;
+        }
+
+        /* Pausa animaciones continuas en mensajes anteriores al último para ahorrar GPU/batería */
+        #chat > .mes:not(:last-child) .mes_text *,
+        #chat > .mes:not(:last-child) .mes_text *::before,
+        #chat > .mes:not(:last-child) .mes_text *::after {
+            animation: none !important;
+            transition: none !important;
         }
     `);
 }
@@ -833,7 +867,31 @@ function scheduleChatMaintenance() {
 }
 
 /**
- * Observa superficialmente #chat y #rm_print_characters_block (subtree: false).
+ * Observa superficialmente un contenedor de imágenes/avatares (subtree: false) para carga diferida.
+ * @param {string} elementId
+ */
+function observeLazyElement(elementId) {
+    const el = document.getElementById(elementId);
+    if (!el) return;
+
+    const existing = lazyObservers.get(elementId);
+    if (existing) existing.disconnect();
+
+    const observer = new MutationObserver((mutations) => {
+        if (!getSettings().lazyImagesEnabled) return;
+        for (const m of mutations) {
+            for (const node of m.addedNodes) {
+                if (node instanceof Element) applyLazyImagesIn(node);
+            }
+        }
+    });
+    observer.observe(el, { childList: true, subtree: false });
+    lazyObservers.set(elementId, observer);
+    applyLazyImagesIn(el);
+}
+
+/**
+ * Observa superficialmente #chat y contenedores de personajes/avatares (subtree: false).
  */
 function observeLazyContainers() {
     const chat = document.getElementById('chat');
@@ -856,19 +914,8 @@ function observeLazyContainers() {
         collapseOldReasoningBlocks();
     }
 
-    const charList = document.getElementById('rm_print_characters_block');
-    if (charList) {
-        if (charListObserver) charListObserver.disconnect();
-        charListObserver = new MutationObserver((mutations) => {
-            if (!getSettings().lazyImagesEnabled) return;
-            for (const m of mutations) {
-                for (const node of m.addedNodes) {
-                    if (node instanceof Element) applyLazyImagesIn(node);
-                }
-            }
-        });
-        charListObserver.observe(charList, { childList: true, subtree: false });
-        applyLazyImagesIn(charList);
+    for (const id of ['rm_print_characters_block', 'user_avatar_block', 'HotSwapWrapper']) {
+        observeLazyElement(id);
     }
 }
 
@@ -1323,7 +1370,7 @@ function mountToolbar() {
             type="text"
             id="lpg-prompt-search"
             class="text_pole"
-            placeholder="Buscar módulo..."
+            placeholder="Buscar en Prompt Manager..."
             autocomplete="off"
             autocorrect="off"
             autocapitalize="off"
@@ -1627,19 +1674,85 @@ async function getRegexEngine() {
 }
 
 /**
- * Determina si un script Regex de Nemo es puramente visual/pesado (Mental Projection, Magpie, Tracker, Emoji FX).
- * Mantiene intactos los scripts esenciales de ejecución (Nemo Runtime, Nemo Story, Nemo Commands).
+ * Determina de forma universal (cualquier preset/personaje/global) si un script Regex es
+ * puramente visual y costoso durante streaming o renderizado.
+ * Nunca marca scripts de tipo promptOnly ni scripts esenciales de runtime.
  * @param {object} script
  * @returns {boolean}
  */
-function isHeavyVisualNemoRegex(script) {
-    if (!script || typeof script !== 'object') return false;
+function isHeavyDisplayRegex(script) {
+    if (!script || typeof script !== 'object' || script.promptOnly) return false;
     const name = String(script.scriptName || '');
+    if (CORE_RUNTIME_REGEX_PATTERN.test(name)) return false;
     if (HEAVY_NEMO_REGEX_PATTERN.test(name)) return true;
-    if (script.markdownOnly && !CORE_RUNTIME_REGEX_PATTERN.test(name) && String(script.findRegex || '').length > 2500) {
-        return true;
+
+    const isDisplayOnly = Boolean(script.markdownOnly)
+        || (Array.isArray(script.placement) && script.placement.length === 1 && script.placement[0] === 0);
+    if (!isDisplayOnly) return false;
+
+    const findLen = String(script.findRegex || '').length;
+    const replaceStr = String(script.replaceString || '');
+    return findLen >= 1200 || replaceStr.length >= 900 || HEAVY_HTML_OUTPUT_REGEX.test(replaceStr);
+}
+
+/**
+ * Actualiza en memoria el conjunto de Regex visuales pesados activos (Global, Personaje y Preset)
+ * para posponerlos durante streaming sin afectar ningún otro preset o script.
+ */
+async function syncHeavyStreamRegexCache() {
+    heavyStreamRegexSources.clear();
+    const engine = await getRegexEngine();
+    if (!engine) return;
+
+    let activeScripts = [];
+    if (typeof engine.getRegexScripts === 'function') {
+        activeScripts = engine.getRegexScripts({ allowedOnly: true }) || [];
+    } else if (typeof engine.getScriptsByType === 'function' && engine.SCRIPT_TYPES) {
+        for (const typeVal of Object.values(engine.SCRIPT_TYPES)) {
+            const list = engine.getScriptsByType(typeVal, { allowedOnly: true });
+            if (Array.isArray(list)) activeScripts.push(...list);
+        }
     }
-    return false;
+
+    for (let i = 0; i < activeScripts.length; i++) {
+        const script = activeScripts[i];
+        if (!script || script.disabled || !script.findRegex) continue;
+        if (isHeavyDisplayRegex(script)) {
+            heavyStreamRegexSources.add(script.findRegex);
+        }
+    }
+}
+
+/**
+ * Al terminar el streaming, re-renderiza el último mensaje una sola vez si se pospuso
+ * algún Regex visual pesado, garantizando que el HTML final quede completo.
+ * @param {number} [mesIdHint]
+ */
+function finishStreamingPass(mesIdHint) {
+    const needsFinalRerender = streamDeferredHit;
+    isActivelyStreaming = false;
+    streamDeferredHit = false;
+    if (!needsFinalRerender) return;
+
+    const chatArr = stScript.chat;
+    const formatFn = stScript.messageFormatting;
+    if (!Array.isArray(chatArr) || typeof formatFn !== 'function' || chatArr.length === 0) return;
+
+    const mesId = (typeof mesIdHint === 'number' && Number.isInteger(mesIdHint) && mesIdHint >= 0 && mesIdHint < chatArr.length)
+        ? mesIdHint
+        : chatArr.length - 1;
+    const msg = chatArr[mesId];
+    if (!msg || msg.is_user) return;
+
+    const mesTextEl = document.querySelector(`#chat .mes[mesid="${mesId}"] .mes_text`);
+    if (!mesTextEl) return;
+
+    mesTextEl.innerHTML = formatFn(msg.mes, msg.name, Boolean(msg.is_system), Boolean(msg.is_user), mesId, {}, false);
+    if (typeof stScript.addCopyToCodeBlocks === 'function' && typeof window.jQuery === 'function') {
+        const mesRoot = mesTextEl.closest('.mes');
+        if (mesRoot) stScript.addCopyToCodeBlocks(window.jQuery(mesRoot));
+    }
+    scheduleChatMaintenance();
 }
 
 /**
@@ -1798,8 +1911,9 @@ function getLowerCached(str) {
 }
 
 /**
- * Envuelve RegexProvider.instance.get() para añadir un pre-filtro O(1)/includes()
- * en Regex con literal obligatorio sin desactivar ningún script de Nemo.
+ * Envuelve RegexProvider.instance.get() para añadir:
+ * 1. Streaming Guard: omite Regex visuales pesados mientras el bot está escribiendo en vivo.
+ * 2. Pre-filtro literal O(1)/includes(): salta Regex sin modificar ni desactivar ningún script.
  */
 async function patchRegexProvider() {
     const engine = await getRegexEngine();
@@ -1813,7 +1927,13 @@ async function patchRegexProvider() {
 
     provider.get = function (regexString) {
         const regex = origGet(regexString);
-        if (!regex || !(regex instanceof RegExp) || patchedRegexes.has(regex)) {
+        if (!regex || !(regex instanceof RegExp)) {
+            return regex;
+        }
+
+        regex.__lpgHeavyStream = heavyStreamRegexSources.has(regexString) || regex.source.length >= 1200;
+
+        if (patchedRegexes.has(regex)) {
             return regex;
         }
 
@@ -1828,15 +1948,21 @@ async function patchRegexProvider() {
             requiredLiteralCache.set(regexString, requiredLiteral);
         }
 
-        if (requiredLiteral) {
-            const icase = regex.ignoreCase;
-            const requiredLower = icase ? requiredLiteral.toLowerCase() : null;
+        const icase = regex.ignoreCase;
+        const requiredLower = requiredLiteral && icase ? requiredLiteral.toLowerCase() : null;
 
-            Object.defineProperty(regex, Symbol.replace, {
-                configurable: true,
-                writable: true,
-                value(target, replaceValue) {
-                    if (getSettings().regexPrefilterEnabled && typeof target === 'string') {
+        Object.defineProperty(regex, Symbol.replace, {
+            configurable: true,
+            writable: true,
+            value(target, replaceValue) {
+                if (typeof target === 'string') {
+                    const settings = getSettings();
+                    if (isActivelyStreaming && settings.streamLiteEnabled && this.__lpgHeavyStream) {
+                        streamDeferredHit = true;
+                        streamSkippedCount++;
+                        return target;
+                    }
+                    if (requiredLiteral && settings.regexPrefilterEnabled) {
                         if (icase) {
                             if (!getLowerCached(target).includes(requiredLower)) {
                                 regexSkippedCount++;
@@ -1847,20 +1973,21 @@ async function patchRegexProvider() {
                             return target;
                         }
                     }
-                    return nativeReplace.call(this, target, replaceValue);
-                },
-            });
-        }
+                }
+                return nativeReplace.call(this, target, replaceValue);
+            },
+        });
 
         patchedRegexes.add(regex);
         return regex;
     };
 
     patchedRegexProviders.add(provider);
+    await syncHeavyStreamRegexCache();
 }
 
 /**
- * Actualiza el indicador del optimizador de Regex dentro del panel de Extensiones.
+ * Actualiza el indicador del optimizador de Regex (Global, Personaje y Preset) en Extensiones.
  */
 async function refreshRegexStatsUI() {
     const statsEl = document.getElementById('lpg-regex-stats');
@@ -1878,44 +2005,53 @@ async function refreshRegexStatsUI() {
         return;
     }
 
+    await syncHeavyStreamRegexCache();
+
+    const getCount = (typeVal, allowedOnly) => {
+        const list = engine.getScriptsByType?.(typeVal, { allowedOnly });
+        return Array.isArray(list) ? list : [];
+    };
+
+    const globalActive = getCount(engine.SCRIPT_TYPES.GLOBAL, true).filter((s) => s && !s.disabled).length;
+    const scopedActive = getCount(engine.SCRIPT_TYPES.SCOPED, true).filter((s) => s && !s.disabled).length;
+    const presetAll = getCount(engine.SCRIPT_TYPES.PRESET, false);
     const apiId = engine.getCurrentPresetAPI?.();
     const presetName = engine.getCurrentPresetName?.();
-    if (!apiId || !presetName) {
-        statsEl.classList.remove('lpg-warn');
-        statsEl.textContent = 'Sin preset de Chat Completion activo.';
-        return;
-    }
+    const presetAllowed = Boolean(apiId && presetName && engine.isPresetScriptsAllowed?.(apiId, presetName));
+    const presetActive = presetAllowed ? presetAll.filter((s) => s && !s.disabled).length : 0;
 
-    const allowed = Boolean(engine.isPresetScriptsAllowed?.(apiId, presetName));
-    const scripts = engine.getScriptsByType?.(engine.SCRIPT_TYPES.PRESET, { allowedOnly: false });
-    const list = Array.isArray(scripts) ? scripts : [];
-    const total = list.length;
-    const enabledCount = list.filter((s) => s && !s.disabled).length;
-    const heavyEnabledCount = list.filter((s) => s && !s.disabled && isHeavyVisualNemoRegex(s)).length;
+    const activeAll = [
+        ...getCount(engine.SCRIPT_TYPES.GLOBAL, true),
+        ...getCount(engine.SCRIPT_TYPES.SCOPED, true),
+        ...(presetAllowed ? presetAll : []),
+    ].filter((s) => s && !s.disabled);
 
-    if (total === 0) {
-        statsEl.classList.remove('lpg-warn');
-        statsEl.textContent = `Preset "${presetName}": sin scripts Regex integrados.`;
-        return;
-    }
+    const totalActive = activeAll.length;
+    const heavyActive = activeAll.filter((s) => isHeavyDisplayRegex(s)).length;
 
-    if (!allowed) {
-        statsEl.classList.remove('lpg-warn');
-        statsEl.textContent = `Regex del preset "${presetName}": PAUSADOS (0/${total} activos — máxima velocidad).`;
-        return;
-    }
+    const hasPresetScripts = Boolean(apiId && presetName && presetAll.length > 0);
+    [disableHeavyBtn, disallowAllBtn, restoreAllBtn].forEach((b) => {
+        if (b) b.disabled = !hasPresetScripts;
+    });
 
-    statsEl.classList.toggle('lpg-warn', enabledCount >= 30);
-    const skipSuffix = getSettings().regexPrefilterEnabled
-        ? ` · Saltos rápidos: ${regexSkippedCount}`
-        : '';
-    statsEl.textContent = `Preset "${presetName}": ${enabledCount}/${total} Regex activos (${heavyEnabledCount} visuales pesados)${skipSuffix}.`;
+    statsEl.classList.toggle('lpg-warn', totalActive >= 30);
+
+    const settings = getSettings();
+    const extras = [];
+    if (settings.regexPrefilterEnabled) extras.push(`Saltos rápidos: ${regexSkippedCount}`);
+    if (settings.streamLiteEnabled) extras.push(`En streaming: ${streamSkippedCount}`);
+    const extraSuffix = extras.length ? ` · ${extras.join(' · ')}` : '';
+    const presetLabel = presetName
+        ? (presetAllowed ? `Preset "${presetName}": ${presetActive}/${presetAll.length}` : `Preset "${presetName}": PAUSADOS`)
+        : 'Sin preset activo';
+
+    statsEl.textContent = `Regex activos: ${totalActive} (Global: ${globalActive}, Personaje: ${scopedActive}, ${presetLabel} · ${heavyActive} visuales pesados)${extraSuffix}.`;
 }
 
 /**
- * Desactiva únicamente los Regex visuales pesados de Nemo (Mental Projection, Magpie, Tracker, Emoji FX).
+ * Desactiva únicamente los Regex visuales pesados del preset actual.
  */
-async function disableHeavyNemoRegexes() {
+async function disableHeavyPresetRegexes() {
     const engine = await getRegexEngine();
     if (!engine) return;
 
@@ -1927,7 +2063,7 @@ async function disableHeavyNemoRegexes() {
 
     let disabledNow = 0;
     const updated = scripts.map((script) => {
-        if (script && !script.disabled && isHeavyVisualNemoRegex(script)) {
+        if (script && !script.disabled && isHeavyDisplayRegex(script)) {
             disabledNow++;
             return { ...script, disabled: true };
         }
@@ -1941,8 +2077,8 @@ async function disableHeavyNemoRegexes() {
     await refreshRegexStatsUI();
     window.toastr?.success(
         disabledNow > 0
-            ? `Se desactivaron ${disabledNow} Regex visuales pesados de Nemo (Runtime/Story intactos).`
-            : 'Los Regex visuales pesados ya estaban desactivados.',
+            ? `Se desactivaron ${disabledNow} Regex visuales pesados del preset.`
+            : 'Los Regex visuales pesados del preset ya estaban desactivados.',
         'Lite Prompt Guard',
     );
 }
@@ -1964,7 +2100,7 @@ async function disallowAllPresetRegexes() {
 }
 
 /**
- * Reactiva los permisos del preset y vuelve a habilitar los Regex visuales de Nemo.
+ * Reactiva los permisos del preset y vuelve a habilitar sus Regex visuales.
  */
 async function restoreAllPresetRegexes() {
     const engine = await getRegexEngine();
@@ -1980,7 +2116,7 @@ async function restoreAllPresetRegexes() {
     if (Array.isArray(scripts) && scripts.length > 0) {
         let restored = 0;
         const updated = scripts.map((script) => {
-            if (script && script.disabled && isHeavyVisualNemoRegex(script)) {
+            if (script && script.disabled && isHeavyDisplayRegex(script)) {
                 restored++;
                 return { ...script, disabled: false };
             }
@@ -1996,7 +2132,7 @@ async function restoreAllPresetRegexes() {
 }
 
 /**
- * Añade el panel minimalista en Extensiones con los toggles de rendimiento y Nemo.
+ * Añade el panel minimalista en Extensiones con los toggles de rendimiento global de SillyTavern.
  */
 function mountExtensionSettings() {
     if (document.getElementById('lpg-settings-panel')) return;
@@ -2015,32 +2151,32 @@ function mountExtensionSettings() {
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
-                <div class="lpg-group-title">Prompt Manager (Nemo)</div>
+                <div class="lpg-group-title">Prompt Manager (Cualquier Preset)</div>
                 <label class="lpg-check-row" for="lpg-setting-sections">
                     <input type="checkbox" id="lpg-setting-sections" />
-                    <span>Agrupar secciones de Nemo (===, ⭐─, ━) colapsables</span>
+                    <span>Agrupar divisores de secciones (===, ---, ═══, ━) colapsables</span>
                 </label>
                 <label class="lpg-check-row" for="lpg-setting-collapsed">
                     <input type="checkbox" id="lpg-setting-collapsed" />
-                    <span>Iniciar con secciones colapsadas (recomendado en Termux)</span>
+                    <span>Iniciar con secciones colapsadas (recomendado en móvil)</span>
                 </label>
                 <label class="lpg-check-row" for="lpg-setting-defer-render">
                     <input type="checkbox" id="lpg-setting-defer-render" />
-                    <span>No re-renderizar Prompt Manager si el panel está cerrado (evita lag al borrar/recibir)</span>
+                    <span>No re-renderizar Prompt Manager si el panel está cerrado</span>
                 </label>
                 <label class="lpg-check-row" for="lpg-setting-fast-toggle">
                     <input type="checkbox" id="lpg-setting-fast-toggle" />
-                    <span>Toggle y edición instantáneos sin reconstruir la lista (botón ↻ para tokens)</span>
+                    <span>Toggle y edición O(1) sin reconstruir lista ni sortable (botón ↻ para tokens)</span>
                 </label>
 
-                <div class="lpg-group-title">Chat y rendimiento móvil</div>
+                <div class="lpg-group-title">Chat, UI y rendimiento móvil (Global)</div>
                 <label class="lpg-check-row" for="lpg-setting-cv">
                     <input type="checkbox" id="lpg-setting-cv" />
-                    <span>Virtualización nativa CSS (content-visibility en chat y personajes)</span>
+                    <span>Virtualización CSS global (chat, personajes, lorebooks, personas y listas regex)</span>
                 </label>
                 <label class="lpg-check-row" for="lpg-setting-gpu-lite">
                     <input type="checkbox" id="lpg-setting-gpu-lite" />
-                    <span>Modo GPU Lite (desactiva blur/sombras/transiciones pesadas)</span>
+                    <span>Modo GPU Lite + pausar animaciones @keyframes en mensajes antiguos</span>
                 </label>
                 <label class="lpg-check-row" for="lpg-setting-lazy-img">
                     <input type="checkbox" id="lpg-setting-lazy-img" />
@@ -2055,21 +2191,25 @@ function mountExtensionSettings() {
                     <span>Escudo CSS anti-rotura en mensajes (.mes_text)</span>
                 </label>
 
-                <div class="lpg-group-title">Optimizador de Regex (Nemo)</div>
+                <div class="lpg-group-title">Motor Regex y Streaming (Global / Personaje / Preset)</div>
                 <label class="lpg-check-row" for="lpg-setting-regex-prefilter">
                     <input type="checkbox" id="lpg-setting-regex-prefilter" />
-                    <span>Acelerador automático de Regex (pre-filtro rápido sin desactivar nada)</span>
+                    <span>Acelerador automático de Regex (pre-filtro literal sin desactivar nada)</span>
                 </label>
-                <div id="lpg-regex-stats">Analizando Regex del preset...</div>
+                <label class="lpg-check-row" for="lpg-setting-stream-lite">
+                    <input type="checkbox" id="lpg-setting-stream-lite" />
+                    <span>Streaming ligero (pospone Regex visuales pesados hasta terminar el mensaje)</span>
+                </label>
+                <div id="lpg-regex-stats">Analizando Regex activos...</div>
                 <div class="lpg-btn-stack">
                     <button type="button" id="lpg-regex-disable-heavy" class="menu_button lpg-action-btn">
-                        Quitar Regex pesados de Nemo (Mental Projection / Magpie / Tracker)
+                        Desactivar Regex visuales pesados del preset actual
                     </button>
                     <button type="button" id="lpg-regex-disallow-all" class="menu_button lpg-action-btn">
-                        Pausar TODOS los Regex del preset (máxima velocidad)
+                        Pausar TODOS los Regex del preset actual
                     </button>
                     <button type="button" id="lpg-regex-restore-all" class="menu_button lpg-action-btn">
-                        Restaurar Regex del preset
+                        Restaurar Regex del preset actual
                     </button>
                 </div>
             </div>
@@ -2078,7 +2218,7 @@ function mountExtensionSettings() {
 
     container.appendChild(wrapper);
 
-    wrapper.querySelector('#lpg-regex-disable-heavy')?.addEventListener('click', disableHeavyNemoRegexes);
+    wrapper.querySelector('#lpg-regex-disable-heavy')?.addEventListener('click', disableHeavyPresetRegexes);
     wrapper.querySelector('#lpg-regex-disallow-all')?.addEventListener('click', disallowAllPresetRegexes);
     wrapper.querySelector('#lpg-regex-restore-all')?.addEventListener('click', restoreAllPresetRegexes);
     wrapper.querySelector('.inline-drawer-toggle')?.addEventListener('click', refreshRegexStatsUI);
@@ -2095,6 +2235,7 @@ function mountExtensionSettings() {
         ['#lpg-setting-collapse-reasoning', 'autoCollapseReasoning', (v) => { if (v) collapseOldReasoningBlocks(); }],
         ['#lpg-setting-css-guard', 'cssGuardEnabled', () => syncChatCssGuard()],
         ['#lpg-setting-regex-prefilter', 'regexPrefilterEnabled', () => { patchRegexProvider(); refreshRegexStatsUI(); }],
+        ['#lpg-setting-stream-lite', 'streamLiteEnabled', () => { syncHeavyStreamRegexCache(); refreshRegexStatsUI(); }],
     ];
 
     for (const [selector, key, onChange] of bindings) {
@@ -2115,6 +2256,7 @@ function registerSillyTavernEvents() {
     const refresh = () => {
         patchPromptManager();
         patchRegexProvider();
+        syncHeavyStreamRegexCache();
         observeDrawerOpen();
         mountToolbar();
         observePromptManager();
@@ -2140,6 +2282,8 @@ function registerSillyTavernEvents() {
     if (event_types?.CHAT_CHANGED) {
         eventSource.on(event_types.CHAT_CHANGED, () => {
             flushPendingSettingsSave(true);
+            isActivelyStreaming = false;
+            streamDeferredHit = false;
             lastLowerSrc = '';
             lastLowerVal = '';
             refresh();
@@ -2150,6 +2294,7 @@ function registerSillyTavernEvents() {
     if (event_types?.CHARACTER_EDITED) {
         eventSource.on(event_types.CHARACTER_EDITED, () => {
             if (!isAiConfigPanelOpen()) deferredStructureDirty = true;
+            syncHeavyStreamRegexCache();
         });
     }
     if (event_types?.OAI_PRESET_CHANGED_BEFORE) {
@@ -2158,11 +2303,32 @@ function registerSillyTavernEvents() {
     if (event_types?.OAI_PRESET_CHANGED_AFTER) eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, resetPresetSections);
     if (event_types?.MAIN_API_CHANGED) eventSource.on(event_types.MAIN_API_CHANGED, resetPresetSections);
 
-    for (const evt of ['GENERATION_STARTED', 'GENERATION_ENDED', 'MESSAGE_SENT', 'MESSAGE_RECEIVED', 'MESSAGE_DELETED', 'MESSAGE_EDITED']) {
+    if (event_types?.STREAM_TOKEN_RECEIVED) {
+        eventSource.on(event_types.STREAM_TOKEN_RECEIVED, () => {
+            isActivelyStreaming = true;
+        });
+    }
+
+    if (event_types?.CHARACTER_MESSAGE_RENDERED) {
+        eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (mesId) => {
+            finishStreamingPass(typeof mesId === 'number' ? mesId : Number(mesId));
+        });
+    }
+
+    for (const evt of ['GENERATION_STARTED', 'GENERATION_ENDED', 'GENERATION_STOPPED', 'MESSAGE_SENT', 'MESSAGE_RECEIVED', 'MESSAGE_DELETED', 'MESSAGE_EDITED']) {
         if (event_types?.[evt]) {
-            eventSource.on(event_types[evt], () => {
-                if (evt === 'GENERATION_STARTED' || evt === 'MESSAGE_SENT') {
+            eventSource.on(event_types[evt], (arg1) => {
+                if (evt === 'GENERATION_STARTED') {
+                    isActivelyStreaming = false;
+                    streamDeferredHit = false;
                     flushPendingSettingsSave(true);
+                    syncHeavyStreamRegexCache();
+                } else if (evt === 'MESSAGE_SENT') {
+                    flushPendingSettingsSave(true);
+                } else if (evt === 'MESSAGE_RECEIVED') {
+                    finishStreamingPass(typeof arg1 === 'number' ? arg1 : Number(arg1));
+                } else if (evt === 'GENERATION_ENDED' || evt === 'GENERATION_STOPPED') {
+                    finishStreamingPass();
                 }
                 patchPromptManager();
                 patchRegexProvider();
@@ -2196,6 +2362,7 @@ jQuery(() => {
     setTimeout(() => {
         patchPromptManager();
         patchRegexProvider();
+        syncHeavyStreamRegexCache();
         bindInstantEditSave();
         bindPanelInteractionTracker();
     }, 1500);

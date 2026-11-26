@@ -1,10 +1,10 @@
 # Lite Prompt Guard (Mobile) para SillyTavern
 
-Extensión ultraligera para **SillyTavern** optimizada para **Termux + Android / Brave**, diseñada como reemplazo de `NemoPresetExt` para mantener presets grandes de **NemoEngine** (400–630+ bloques) ordenados y eliminar los tirones de rendimiento al usar el chat o borrar mensajes.
+Extensión ultraligera para **SillyTavern** optimizada para **Termux + Android / Brave**, diseñada para acelerar SillyTavern de forma global con **cualquier preset** (predeterminado, personalizado, Marinara, Celia, PixiJB, NemoEngine, etc.), listas grandes de personajes, lorebooks y streaming.
 
 ## Instalación rápida desde SillyTavern (Git URL)
 
-1. Desactiva o desinstala `NemoPresetExt` en **Extensions → Manage Extensions** (si lo tenías instalado).
+1. Desactiva o desinstala extensiones pesadas de gestión de presets (p. ej. `NemoPresetExt`) en **Extensions → Manage Extensions** si usabas alguna.
 2. En SillyTavern, abre **Extensions → Install Extension**.
 3. Pega la URL pública de este repositorio:
    ```text
@@ -14,34 +14,27 @@ Extensión ultraligera para **SillyTavern** optimizada para **Termux + Android /
 
 ---
 
-## 1. Qué problemas de SillyTavern y Nemo resuelve
+## 1. Optimizaciones globales incluidas (`v1.7.0`)
 
-1. **Congelamiento de varios segundos al recibir un mensaje del bot (262 Regex activos de NemoEngine):**
-   - Los presets de `NemoEngine` traen **273 scripts Regex incrustados (262 activos, 237 de visualización)** —incluyendo `Mental Projection` (117), `Nemo + Magpie` (37), `Tracker UI` (19) y expresiones de hasta 6.464 caracteres— que SillyTavern ejecuta síncronamente en el hilo principal de Brave cada vez que termina el mensaje del bot (y repetidamente si usas **Streaming**).
-   - **Solución 1 — Acelerador automático sin desactivar nada (v1.4.0):** intercepta `RegexProvider.instance.get()` y aplica un pre-filtro literal (`includes`) sobre el 88% de los Regex de Nemo (209/237) que requieren etiquetas específicas (`</mental_state>`, `<nemo_story`, etc.), logrando ~41× menos tiempo de CPU manteniendo todos los Regex activos y un contador en vivo (`Saltos rápidos`).
-   - **Solución 2 — Optimizador en 1 clic:** en **Extensions → Lite Prompt Guard (Mobile) → Optimizador de Regex (Nemo)** también puedes desactivar solo los Regex visuales pesados o pausar todos los Regex del preset al instante.
-2. **Congelamiento y bajones al abrir el menú de toggles o activar/desactivar/editar un módulo (`PromptManager.render`, `sortable()`, `saveSettings()`):**
-   - Cada vez que activabas un toggle o guardabas una edición en SillyTavern, `handleToggle` y `handleSavePrompt` reconstruían los 629 nodos del Prompt Manager (`innerHTML = ''` + ~2.500 listeners + jQuery UI `.sortable()`), y cada clic disparaba 1 s después un `saveSettings()` completo (`JSON.stringify` de 3–8 MB + I/O en Termux) además de escaneos de `touch-punch`/Sizzle y `filter: drop-shadow` por icono en cada fila.
-   - **Solución (v1.6.0):**
-     - **Toggle O(1) (<0.1 ms) y expansión O(sección):** índice estructural en memoria (`pmIndex` + `Map` de `prompt_order`) que actualiza solo la fila `<li>` y el badge de su sección sin re-escanear los 630 nodos ni provocar mutaciones DOM redundantes.
-     - **`jQuery UI .sortable()` + `touch-punch` desactivados por defecto:** elimina los listeners táctiles no pasivos, las búsquedas Sizzle y los reflujos en cada toque/scroll; incluye el botón **`⇅`** en la barra para activar el arrastre solo cuando quieras reordenar módulos.
-     - **Persistencia inteligente en reposo:** agrupa todos tus toggles y guarda una sola vez tras una pausa de inactividad (3,5 s en `requestIdleCallback`), o de inmediato si cierras el panel, envías un mensaje, cambias de preset o sales de la pestaña.
-     - **Aislamiento CSS y respuesta táctil móvil:** `contain: layout style paint` por fila, `touch-action: manipulation` y eliminación de `filter: drop-shadow` / `transition: all` en los iconos del Prompt Manager.
-     - Mantienes el botón **`↻`** en la barra para recalcular tokens manualmente cuando quieras, y abrir `#left-nav-panel` sigue siendo en 0 ms si solo hubo mensajes nuevos o borrados.
-3. **Bajón al borrar, editar o recibir mensajes (`PromptManager.renderDebounced`):**
-   - En SillyTavern (`PromptManager.js`), cada `MESSAGE_DELETED`, `MESSAGE_EDITED` o `MESSAGE_RECEIVED` dispara `renderDebounced()` → `tryGenerate()` (simulación completa de contexto y conteo de tokens de los 400–630+ bloques de Nemo) y reconstruye toda la lista del Prompt Manager aunque el panel lateral esté **cerrado**.
-   - **Solución:** el **Render Guard** pospone esos re-renders mientras `#left-nav-panel` está cerrado y solo actualiza cuando abres el panel.
-2. **Lag al activar/desactivar módulos de Nemo:**
-   - Activa el modo **Toggle rápido** (usa `render(false)` sin `tryGenerate()`), manteniendo un botón **`↻`** en la barra para recalcular tokens manualmente cuando lo necesites.
-3. **Saturación del DOM con presets de 400–630+ bloques:**
-   - Detecta los divisores nativos de Nemo (`===`, `⭐─`, `━`, `───`) y subcabeceras (`<...>`) **sin clonar ni mover ningún `<li>`**, iniciando colapsado para pintar solo ~20 cabeceras en pantalla.
-   - Incluye barra persistente con buscador con *debounce* (120 ms), botón **`Solo ON`** y botones **`+` / `−`**.
-4. **Scroll lento, consumo de GPU y RAM en Android/Brave:**
-   - **`content-visibility: auto`** en mensajes del chat (`.mes`) y tarjetas de personajes (`.character_select`).
-   - **Modo GPU Lite:** desactiva `backdrop-filter: blur`, sombras pesadas y transiciones UI en paneles y mensajes.
-   - **Carga diferida (`loading="lazy"`, `decoding="async"`)** en imágenes y avatares.
-   - **Auto-colapso** de bloques de razonamiento (`thinking` / `<details>`) en mensajes antiguos.
-   - **Escudo CSS anti-rotura** para `.mes_text` que evita que HTML/CSS de presets se encime sobre avatares o mensajes anteriores.
+1. **Streaming Ligero + Acelerador automático de Regex (Global / Personaje / Preset):**
+   - **Streaming ligero (v1.7.0):** durante el streaming (`STREAM_TOKEN_RECEIVED`), pospone automáticamente los scripts Regex puramente visuales/pesados (HTML complejo, tablas, `<style>`, SVG, `@keyframes` o expresiones largas) y los aplica una única vez al finalizar el mensaje, eliminando los tirones mientras el bot escribe.
+   - **Pre-filtro literal O(1) (v1.4.0):** intercepta `RegexProvider.instance.get()` y verifica con `includes()` las subcadenas literales obligatorias antes de ejecutar la expresión regular completa, sin desactivar ningún script.
+   - **Controles rápidos en 1 clic:** en **Extensions → Lite Prompt Guard (Mobile)** muestra estadísticas combinadas (Global, Personaje y Preset) y permite desactivar los Regex visuales pesados o pausar todos los Regex del preset actual al instante.
+
+2. **Toggles instantáneos O(1) y secciones colapsables en Prompt Manager (cualquier preset):**
+   - **Sin reconstrucción del DOM:** los toggles y ediciones de prompts existentes se aplican en el acto (`<0.1 ms`) sobre la fila `<li>` usando un índice en memoria (`pmIndex` + `Map` de `prompt_order`), sin volver a ejecutar `PromptManager.render()` ni escanear toda la lista.
+   - **`jQuery UI .sortable()` + `touch-punch` desactivados por defecto (v1.6.0):** evita listeners táctiles no pasivos, búsquedas Sizzle y reflujos en cada toque/scroll; incluye el botón **`⇅`** en la barra para activar el arrastre solo cuando quieras reordenar módulos.
+   - **Persistencia inteligente en reposo (v1.6.0):** agrupa todos tus cambios y ejecuta `saveSettings()` una sola vez tras 3,5 s de inactividad en `requestIdleCallback` (o de inmediato al cerrar el panel, enviar un mensaje, cambiar de preset o salir de la pestaña).
+   - **Divisores universales colapsables (v1.7.0):** detecta cabeceras visuales estándar de cualquier preset (`===`, `---`, `***`, `___`, `═══`, `━━━`, `───`, `⭐─`, `✦─`, etc.) y subcabeceras `<...>` sin clonar nodos, con buscador con *debounce*, **`Solo ON`**, **`+` / `−`**, **`⇅`** y **`↻`** (recálculo manual de tokens).
+
+3. **Render Guard contra lag al borrar, editar o recibir mensajes:**
+   - En SillyTavern, `MESSAGE_DELETED`, `MESSAGE_EDITED` y `MESSAGE_RECEIVED` disparan `PromptManager.renderDebounced()` → `tryGenerate()` incluso con el panel lateral cerrado. El **Render Guard** pospone esos re-renders hasta que realmente necesites abrir el panel (apertura en 0 ms si solo cambió el chat).
+
+4. **Virtualización CSS global, GPU Lite y limpieza móvil:**
+   - **Virtualización `content-visibility: auto` (v1.7.0):** aplicada a mensajes del chat (`.mes`), tarjetas de personajes y grupos (`.character_select`), entradas de Lorebook/World Info (`.world_entry`), avatares de persona (`.avatar-container`) y listas de scripts Regex.
+   - **Modo GPU Lite + pausa de `@keyframes` (v1.7.0):** desactiva `backdrop-filter: blur`, sombras y transiciones UI pesadas, y pausa animaciones CSS continuas en mensajes anteriores al último.
+   - **Carga diferida (`loading="lazy"`, `decoding="async"`):** en imágenes del chat, lista de personajes, avatares de persona y barra `HotSwap`.
+   - **Auto-colapso** de bloques de razonamiento (`thinking` / `<details>`) en mensajes antiguos y **Escudo CSS** en `.mes_text` para evitar solapamientos en pantalla móvil.
 
 ---
 
@@ -49,8 +42,13 @@ Extensión ultraligera para **SillyTavern** optimizada para **Termux + Android /
 
 - En `config.yaml` de SillyTavern (Termux):
   - `performance.lazyLoadCharacters: true`
+  - `performance.memoryCacheCapacity: '50mb'`
   - `thumbnails.enabled: true` (`format: 'webp'`, `quality: 75`)
+- En la lista de personajes de SillyTavern:
+  - Mantén la paginación en `25` o `50` personajes por página.
 - En **User Settings** de SillyTavern:
-  - **# of messages to load:** `20` o `30` (reduce mucho la RAM inicial en móvil).
+  - **# of messages to load:** `20` o `30` (reduce la RAM inicial en móvil).
+  - **Streaming FPS:** `8`–`10` y desactiva `Smooth Streaming` / `Stream Fade-In`.
 - En **Extensions → Manage Extensions**:
-  - Desactiva extensiones integradas que no uses (TTS, Image Generation, Vector Storage, etc.).
+  - Desactiva extensiones integradas que no uses (`TTS`, `Image Generation`, `Vector Storage`, `Summarize`, etc.).
+- Mantén en `OpenAI Settings` solo los presets que uses (cada preset grande de varios MB se carga en memoria al iniciar).
