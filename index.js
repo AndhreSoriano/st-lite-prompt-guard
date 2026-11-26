@@ -1,21 +1,28 @@
 /**
- * Lite Prompt Guard (Mobile) v1.5.0
+ * Lite Prompt Guard (Mobile) v1.6.0
  *
  * Optimizador ultraligero para SillyTavern + NemoEngine en Termux / Android / Brave:
  * 1. Cero reconstrucción del DOM en #completion_prompt_manager_list (solo clases CSS y ::before/::after).
- * 2. Toggle y edición de prompts instantáneos (<1 ms): actualiza solo la fila <li> modificada sin
- *    reconstruir los 600+ nodos ni re-inicializar jQuery UI sortable() en cada clic.
- * 3. Secciones colapsables para divisores de Nemo (===, ⭐─, ━, ───) y subcabeceras (<...>).
- * 4. Barra compacta persistente: buscador con debounce, "Solo ON", expandir/colapsar (+/−) y recálculo manual (↻).
- * 5. Render Guard: evita re-renders al borrar/editar/recibir mensajes y abre #left-nav-panel en 0 ms.
- * 6. Acelerador automático de Regex: pre-filtro literal sin desactivar scripts (40x+ más rápido en Nemo).
- * 7. Optimizador manual de Regex de Nemo y mejoras móviles (content-visibility, GPU Lite, lazy images,
- *    auto-colapso thinking y escudo CSS en .mes_text).
+ * 2. Toggle O(1) (<0.1 ms) y apertura de secciones O(sección): índice en memoria sin re-escanear
+ *    los 600+ nodos en cada clic ni mutar el DOM de filas no afectadas.
+ * 3. jQuery UI .sortable() + touch-punch desactivados por defecto (botón ⇅ en barra para reordenar
+ *    bajo demanda), evitando escaneos Sizzle y cálculos de posición en cada toque.
+ * 4. Persistencia inteligente en reposo (coalesced idle save): evita congelamientos por
+ *    JSON.stringify + /api/settings/save 1 s después de cada toggle, con volcado inmediato al cerrar
+ *    el panel, enviar mensaje, cambiar preset o ocultar/cerrar la pestaña.
+ * 5. Aislamiento CSS (contain: layout style paint) y eliminación de drop-shadow/transiciones en iconos.
+ * 6. Render Guard: pospone re-renders ocultos y abre #left-nav-panel en 0 ms.
+ * 7. Acelerador automático de Regex (pre-filtro literal 40x+ más rápido) y mejoras móviles.
  */
 
-import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
+import * as stScript from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import { promptManager } from '../../../openai.js';
+
+const { eventSource, event_types, saveSettingsDebounced } = stScript;
+const saveSettingsImmediate = typeof stScript.saveSettings === 'function'
+    ? () => stScript.saveSettings()
+    : () => saveSettingsDebounced();
 
 const EXTENSION_KEY = 'lite_prompt_guard';
 const DEFAULT_SETTINGS = Object.freeze({
@@ -33,6 +40,8 @@ const DEFAULT_SETTINGS = Object.freeze({
 
 const SEARCH_DEBOUNCE_MS = 120;
 const RENDER_DEBOUNCE_MS = 250;
+const SMART_SAVE_IDLE_MS = 3500;
+const SMART_SAVE_MAX_WAIT_MS = 15000;
 const SECTION_DIVIDER_REGEX = /^(=+|⭐─+|━+|─{3,})/;
 const SUBHEADER_REGEX = /^<[^>]+>$/;
 const HEAVY_NEMO_REGEX_PATTERN = /\b(mental\s*projection|magpie|tracker\s*ui|emoji\s*fx|nemo\s*mp)\b/i;
@@ -54,13 +63,29 @@ const requiredLiteralCache = new Map();
 /** Secciones actualmente expandidas en memoria (sobreviven a re-renders nativos). */
 const openSections = new Set();
 
+/** Índice estructural en memoria del Prompt Manager para toggles O(1) y secciones O(k). */
+let pmIndex = null;
+let pmIndexDirty = true;
+
+/** Caché O(1) de prompt_order para evitar búsquedas lineales en cada toggle. */
+let cachedOrderArrayRef = null;
+let cachedOrderLength = -1;
+const promptOrderMap = new Map();
+
 let initializedPresetSections = false;
 let onlyActiveFilter = false;
+let reorderMode = false;
+let origMakeDraggableRef = null;
 let deferredStructureDirty = false;
 let forceFullRender = false;
 let regexSkippedCount = 0;
 let lastLowerSrc = '';
 let lastLowerVal = '';
+
+let pendingSettingsSave = false;
+let smartSaveTimer = null;
+let smartSaveIdleId = null;
+let smartSaveFirstQueuedAt = 0;
 
 let searchDebounceTimer = null;
 let renderDebouncedTimer = null;
@@ -75,6 +100,8 @@ let chatObserver = null;
 let charListObserver = null;
 let sectionClickBound = false;
 let editSaveBound = false;
+let panelActivityBound = false;
+let lifecycleFlushBound = false;
 
 /**
  * Inicializa y devuelve la configuración persistente de la extensión.
@@ -165,9 +192,38 @@ function injectBaseStyles() {
             display: none;
         }
 
-        #lpg-only-active.lpg-active {
+        #lpg-only-active.lpg-active,
+        #lpg-reorder-mode.lpg-active {
             border-color: rgba(76, 175, 80, 0.8);
             background: rgba(76, 175, 80, 0.18);
+        }
+
+        /* Aislamiento de layout/paint y cero blur/transiciones pesadas en filas e iconos del Prompt Manager */
+        #completion_prompt_manager #completion_prompt_manager_list > li.completion_prompt_manager_prompt:not(.ui-sortable-helper) {
+            contain: layout style paint;
+        }
+
+        #completion_prompt_manager #completion_prompt_manager_list li.completion_prompt_manager_prompt span span span,
+        #completion_prompt_manager .completion_prompt_manager_header_advanced span {
+            filter: none !important;
+            transition: none !important;
+        }
+
+        #completion_prompt_manager,
+        #completion_prompt_manager .prompt-manager-toggle-action,
+        #completion_prompt_manager .prompt-manager-edit-action,
+        #completion_prompt_manager .prompt-manager-detach-action,
+        #completion_prompt_manager .prompt-manager-inspect-action,
+        #completion_prompt_manager_list > .completion_prompt_manager_prompt.lpg-section {
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        #completion_prompt_manager #completion_prompt_manager_list li.completion_prompt_manager_prompt .prompt_manager_prompt_controls .prompt-manager-toggle-action {
+            min-width: 24px;
+            min-height: 24px;
+            align-items: center;
+            justify-content: center;
         }
 
         #lpg-toolbar.lpg-no-sections .lpg-sec-btn {
@@ -398,16 +454,225 @@ function hasRenderedPromptItems() {
 }
 
 /**
+ * Vuelca los cambios pendientes en settings.json si existe un guardado diferido.
+ * @param {boolean} immediate
+ */
+function flushPendingSettingsSave(immediate = true) {
+    if (smartSaveTimer !== null) {
+        clearTimeout(smartSaveTimer);
+        smartSaveTimer = null;
+    }
+    if (smartSaveIdleId !== null && typeof cancelIdleCallback === 'function') {
+        cancelIdleCallback(smartSaveIdleId);
+        smartSaveIdleId = null;
+    }
+    if (!pendingSettingsSave) return;
+
+    pendingSettingsSave = false;
+    smartSaveFirstQueuedAt = 0;
+
+    if (immediate) {
+        saveSettingsImmediate();
+    } else {
+        saveSettingsImmediate();
+    }
+}
+
+/**
+ * Programa el guardado de ajustes tras una pausa de inactividad (evita JSON.stringify + I/O
+ * en medio de toques rápidos o scroll dentro del panel).
+ */
+function scheduleSmartSettingsSave() {
+    pendingSettingsSave = true;
+    const now = performance.now();
+    if (smartSaveFirstQueuedAt === 0) {
+        smartSaveFirstQueuedAt = now;
+    }
+
+    if (smartSaveTimer !== null) {
+        clearTimeout(smartSaveTimer);
+        smartSaveTimer = null;
+    }
+    if (smartSaveIdleId !== null && typeof cancelIdleCallback === 'function') {
+        cancelIdleCallback(smartSaveIdleId);
+        smartSaveIdleId = null;
+    }
+
+    const elapsed = now - smartSaveFirstQueuedAt;
+    const runIdleFlush = () => {
+        if (!pendingSettingsSave) return;
+        if (typeof requestIdleCallback === 'function') {
+            smartSaveIdleId = requestIdleCallback(() => {
+                smartSaveIdleId = null;
+                flushPendingSettingsSave(false);
+            }, { timeout: 2000 });
+        } else {
+            smartSaveIdleId = setTimeout(() => {
+                smartSaveIdleId = null;
+                flushPendingSettingsSave(false);
+            }, 0);
+        }
+    };
+
+    if (elapsed >= SMART_SAVE_MAX_WAIT_MS) {
+        runIdleFlush();
+        return;
+    }
+
+    const waitMs = Math.min(SMART_SAVE_IDLE_MS, SMART_SAVE_MAX_WAIT_MS - elapsed);
+    smartSaveTimer = setTimeout(() => {
+        smartSaveTimer = null;
+        runIdleFlush();
+    }, waitMs);
+}
+
+/**
+ * Retrasa brevemente el guardado pendiente mientras el usuario sigue tocando o haciendo scroll.
+ */
+function notePanelInteraction() {
+    if (!pendingSettingsSave) return;
+    if (performance.now() - smartSaveFirstQueuedAt >= SMART_SAVE_MAX_WAIT_MS) return;
+    scheduleSmartSettingsSave();
+}
+
+/**
+ * Registra listeners pasivos en #left-nav-panel para no guardar justo durante el scroll/toque.
+ */
+function bindPanelInteractionTracker() {
+    if (panelActivityBound) return;
+    const panel = document.getElementById('left-nav-panel');
+    if (!panel) return;
+
+    const opts = { passive: true, capture: true };
+    panel.addEventListener('pointerdown', notePanelInteraction, opts);
+    panel.addEventListener('touchmove', notePanelInteraction, opts);
+    panel.addEventListener('wheel', notePanelInteraction, opts);
+    panel.addEventListener('keydown', notePanelInteraction, opts);
+    panelActivityBound = true;
+}
+
+/**
+ * Garantiza guardado inmediato antes de cerrar pestaña, ocultar app o guardar/exportar presets.
+ */
+function bindLifecycleSaveFlush() {
+    if (lifecycleFlushBound) return;
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+            flushPendingSettingsSave(true);
+        }
+    });
+    window.addEventListener('pagehide', () => flushPendingSettingsSave(true));
+    window.addEventListener('beforeunload', () => flushPendingSettingsSave(true));
+
+    document.addEventListener('click', (event) => {
+        if (!pendingSettingsSave) return;
+        const target = event.target instanceof Element ? event.target : null;
+        if (!target) return;
+        if (target.closest('[data-preset-manager-update], [data-preset-manager-new], [data-preset-manager-rename], [data-preset-manager-export], #update_oai_preset')) {
+            flushPendingSettingsSave(true);
+        }
+    }, true);
+
+    lifecycleFlushBound = true;
+}
+
+/**
+ * Destruye jQuery UI .sortable() y limpia .ui-sortable-handle en #completion_prompt_manager_list
+ * para evitar escaneos Sizzle y touch-punch durante el scroll o al pulsar toggles.
+ */
+function destroySortableIfActive() {
+    const listEl = document.getElementById('completion_prompt_manager_list');
+    if (!listEl || typeof window.jQuery !== 'function') return;
+
+    const $list = window.jQuery(listEl);
+    if ($list.hasClass('ui-sortable') || Boolean($list.data('ui-sortable') || $list.data('sortable'))) {
+        try {
+            $list.sortable('destroy');
+        } catch (_) {
+            // Ignorar si ya fue destruido parcialmente
+        }
+    }
+
+    const leftoverHandles = listEl.querySelectorAll('.ui-sortable-handle');
+    for (let i = 0; i < leftoverHandles.length; i++) {
+        leftoverHandles[i].classList.remove('ui-sortable-handle');
+    }
+}
+
+/**
+ * Sincroniza el modo de reordenamiento (botón ⇅) con el estado de jQuery UI .sortable().
+ */
+function syncSortableMode() {
+    const reorderBtn = document.getElementById('lpg-reorder-mode');
+    if (reorderBtn) {
+        reorderBtn.classList.toggle('lpg-active', reorderMode);
+        reorderBtn.setAttribute('aria-pressed', String(reorderMode));
+    }
+
+    if (!getSettings().fastToggle || reorderMode) {
+        if (typeof origMakeDraggableRef === 'function') {
+            origMakeDraggableRef();
+            if (reorderMode && typeof window.jQuery === 'function') {
+                const $list = window.jQuery('#completion_prompt_manager_list');
+                if ($list.data('ui-sortable') || $list.data('sortable')) {
+                    try {
+                        $list.sortable('option', 'handle', '.drag-handle');
+                    } catch (_) {
+                        // Ignorar si aún no está inicializado
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if (sortableTimer !== null) {
+        clearTimeout(sortableTimer);
+        sortableTimer = null;
+    }
+    destroySortableIfActive();
+}
+
+/**
+ * Envuelve promptManager.handleToggle si aún no está parcheado (por si init() se ejecuta tarde).
+ * @param {object} pm
+ */
+function wrapPromptManagerHandleToggle(pm) {
+    if (!pm || typeof pm.handleToggle !== 'function' || pm.handleToggle.__lpgPatched) return;
+
+    const origHandleToggle = pm.handleToggle.bind(pm);
+    const wrappedHandleToggle = function (event) {
+        if (getSettings().fastToggle) {
+            const target = event?.target instanceof Element ? event.target : null;
+            const toggleEl = target?.closest('.prompt-manager-toggle-action');
+            if (toggleEl && handleInstantToggle(toggleEl, event)) {
+                return;
+            }
+        }
+        return origHandleToggle(event);
+    };
+    wrappedHandleToggle.__lpgPatched = true;
+    pm.handleToggle = wrappedHandleToggle;
+}
+
+/**
  * Protege la instancia de PromptManager contra re-renders costosos al borrar/editar/recibir
- * mensajes, pospone makeDraggable() y omite tryGenerate() cuando fastToggle está activo.
+ * mensajes, desactiva sortable() salvo en modo ⇅, y omite tryGenerate() cuando fastToggle está activo.
  */
 function patchPromptManager() {
-    if (!promptManager || patchedPromptManagers.has(promptManager)) return;
+    if (!promptManager) return;
+
+    wrapPromptManagerHandleToggle(promptManager);
+    if (patchedPromptManagers.has(promptManager)) {
+        syncSortableMode();
+        return;
+    }
 
     const origRender = promptManager.render.bind(promptManager);
-    const origMakeDraggable = typeof promptManager.makeDraggable === 'function'
-        ? promptManager.makeDraggable.bind(promptManager)
-        : null;
+    if (typeof promptManager.makeDraggable === 'function') {
+        origMakeDraggableRef = promptManager.makeDraggable.bind(promptManager);
+    }
 
     promptManager.render = function (afterTryGenerate = true) {
         const settings = getSettings();
@@ -441,22 +706,41 @@ function patchPromptManager() {
         }, RENDER_DEBOUNCE_MS);
     };
 
-    if (origMakeDraggable) {
+    if (origMakeDraggableRef) {
         promptManager.makeDraggable = function () {
             if (!getSettings().fastToggle) {
-                return origMakeDraggable();
+                return origMakeDraggableRef();
+            }
+            if (!reorderMode) {
+                destroySortableIfActive();
+                return;
             }
             if (sortableTimer !== null) {
                 clearTimeout(sortableTimer);
             }
             sortableTimer = setTimeout(() => {
                 sortableTimer = null;
-                origMakeDraggable();
-            }, 150);
+                if (!reorderMode) {
+                    destroySortableIfActive();
+                    return;
+                }
+                origMakeDraggableRef();
+                if (typeof window.jQuery === 'function') {
+                    const $list = window.jQuery('#completion_prompt_manager_list');
+                    if ($list.data('ui-sortable') || $list.data('sortable')) {
+                        try {
+                            $list.sortable('option', 'handle', '.drag-handle');
+                        } catch (_) {
+                            // Ignorar
+                        }
+                    }
+                }
+            }, 100);
         };
     }
 
     patchedPromptManagers.add(promptManager);
+    syncSortableMode();
 }
 
 /**
@@ -474,11 +758,14 @@ function forceRecalculateTokens() {
 }
 
 /**
- * Observa la apertura del panel izquierdo (#left-nav-panel) y solo renderiza si la estructura cambió.
+ * Observa la apertura/cierre de #left-nav-panel: solo renderiza si cambió la estructura,
+ * y vuelca cambios pendientes al cerrar el panel.
  */
 function observeDrawerOpen() {
     const panel = document.getElementById('left-nav-panel');
     if (!panel) return;
+
+    bindPanelInteractionTracker();
 
     if (drawerObserver) {
         drawerObserver.disconnect();
@@ -486,7 +773,11 @@ function observeDrawerOpen() {
     }
 
     drawerObserver = new MutationObserver(() => {
-        if ((deferredStructureDirty || !hasRenderedPromptItems()) && isAiConfigPanelOpen()) {
+        if (!isAiConfigPanelOpen()) {
+            flushPendingSettingsSave(true);
+            return;
+        }
+        if (deferredStructureDirty || !hasRenderedPromptItems()) {
             deferredStructureDirty = false;
             if (promptManager) {
                 promptManager.render(!getSettings().fastToggle);
@@ -621,6 +912,151 @@ function scheduleVisibilityUpdate() {
 }
 
 /**
+ * Marca el índice estructural en memoria del Prompt Manager como obsoleto.
+ */
+function invalidatePmIndex() {
+    pmIndexDirty = true;
+}
+
+/**
+ * Construye el índice estructural en memoria de #completion_prompt_manager_list en una sola pasada.
+ * @param {HTMLElement} listEl
+ * @param {object} settings
+ */
+function buildPmIndex(listEl, settings) {
+    const rows = listEl.querySelectorAll(':scope > .completion_prompt_manager_prompt');
+    const entries = new Array(rows.length);
+    const byRow = new WeakMap();
+    const sections = [];
+    const subheaders = [];
+
+    let currentSection = null;
+    let currentSubheader = null;
+    let totalLeafPrompts = 0;
+
+    for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const meta = getRowMeta(row, i);
+        const isEnabled = !row.classList.contains('completion_prompt_manager_prompt_disabled');
+        const domSection = row.classList.contains('lpg-section');
+        const domSubheader = row.classList.contains('lpg-subheader');
+        const domOpen = row.classList.contains('lpg-open');
+        const domBadge = row.getAttribute('data-lpg-badge');
+        const domHidden = row.classList.contains('lpg-hidden');
+
+        if (meta.isSection && settings.sectionsEnabled) {
+            const entry = {
+                row,
+                meta,
+                section: null,
+                subheader: null,
+                isEnabled,
+                isSectionHeader: true,
+                isSubheaderRow: false,
+                domSection,
+                domSubheader,
+                domOpen,
+                domBadge,
+                domHidden,
+            };
+            currentSection = {
+                id: meta.id,
+                headerEntry: entry,
+                subheaders: [],
+                leafEntries: [],
+                memberEntries: [],
+                total: 0,
+                active: 0,
+                hasVisibleChild: false,
+            };
+            entry.section = currentSection;
+            sections.push(currentSection);
+            currentSubheader = null;
+            entries[i] = entry;
+            byRow.set(row, entry);
+            continue;
+        }
+
+        if (meta.isSubheader && settings.sectionsEnabled) {
+            const entry = {
+                row,
+                meta,
+                section: currentSection,
+                subheader: null,
+                isEnabled,
+                isSectionHeader: false,
+                isSubheaderRow: true,
+                domSection,
+                domSubheader,
+                domOpen,
+                domBadge,
+                domHidden,
+            };
+            currentSubheader = {
+                entry,
+                section: currentSection,
+                hasVisibleChild: false,
+            };
+            entry.subheader = currentSubheader;
+            subheaders.push(currentSubheader);
+            if (currentSection) {
+                currentSection.subheaders.push(currentSubheader);
+                currentSection.memberEntries.push(entry);
+            }
+            entries[i] = entry;
+            byRow.set(row, entry);
+            continue;
+        }
+
+        totalLeafPrompts++;
+        if (currentSection) {
+            currentSection.total++;
+            if (isEnabled) currentSection.active++;
+        }
+
+        const entry = {
+            row,
+            meta,
+            section: currentSection,
+            subheader: currentSubheader,
+            isEnabled,
+            isSectionHeader: false,
+            isSubheaderRow: false,
+            domSection,
+            domSubheader,
+            domOpen,
+            domBadge,
+            domHidden,
+        };
+        if (currentSection) {
+            currentSection.leafEntries.push(entry);
+            currentSection.memberEntries.push(entry);
+        }
+        entries[i] = entry;
+        byRow.set(row, entry);
+    }
+
+    if (!initializedPresetSections && sections.length > 0) {
+        if (!settings.startCollapsed) {
+            for (let i = 0; i < sections.length; i++) {
+                openSections.add(sections[i].id);
+            }
+        }
+        initializedPresetSections = true;
+    }
+
+    pmIndex = {
+        listEl,
+        entries,
+        byRow,
+        sections,
+        subheaders,
+        totalLeafPrompts,
+    };
+    pmIndexDirty = false;
+}
+
+/**
  * Agrupa visualmente las secciones de Nemo y aplica los filtros sin mover ni clonar nodos del DOM.
  */
 function applyVisibilityNow() {
@@ -644,148 +1080,116 @@ function applyVisibilityNow() {
     }
 
     if (!listEl) {
+        pmIndex = null;
+        pmIndexDirty = true;
         if (countEl) countEl.textContent = '';
         if (toolbar) toolbar.classList.add('lpg-no-sections');
         return;
     }
 
-    const rows = listEl.querySelectorAll(':scope > .completion_prompt_manager_prompt');
-    const rowInfo = new Array(rows.length);
-    const sections = [];
-    const subheaders = [];
-
-    let currentSection = null;
-    let currentSubheader = null;
-
-    // Pasada 1: clasificar filas y contar módulos activos/totales por sección
-    for (let i = 0; i < rows.length; i++) {
-        const row = rows[i];
-        const meta = getRowMeta(row, i);
-        const isEnabled = !row.classList.contains('completion_prompt_manager_prompt_disabled');
-
-        if (meta.isSection && settings.sectionsEnabled) {
-            currentSection = {
-                id: meta.id,
-                headerIndex: i,
-                row,
-                total: 0,
-                active: 0,
-                hasVisibleChild: false,
-            };
-            sections.push(currentSection);
-            currentSubheader = null;
-            rowInfo[i] = { meta, section: currentSection, subheader: null, isEnabled, isSectionHeader: true, isSubheaderRow: false };
-            continue;
-        }
-
-        if (meta.isSubheader && settings.sectionsEnabled) {
-            currentSubheader = {
-                index: i,
-                row,
-                section: currentSection,
-                hasVisibleChild: false,
-            };
-            subheaders.push(currentSubheader);
-            rowInfo[i] = { meta, section: currentSection, subheader: currentSubheader, isEnabled, isSectionHeader: false, isSubheaderRow: true };
-            continue;
-        }
-
-        if (currentSection) {
-            currentSection.total++;
-            if (isEnabled) currentSection.active++;
-        }
-
-        rowInfo[i] = { meta, section: currentSection, subheader: currentSubheader, isEnabled, isSectionHeader: false, isSubheaderRow: false };
+    if (pmIndexDirty || !pmIndex || pmIndex.listEl !== listEl) {
+        buildPmIndex(listEl, settings);
     }
+
+    const { entries, sections, subheaders, totalLeafPrompts } = pmIndex;
 
     if (toolbar) {
         toolbar.classList.toggle('lpg-no-sections', !settings.sectionsEnabled || sections.length === 0);
     }
 
-    if (!initializedPresetSections && sections.length > 0) {
-        if (!settings.startCollapsed) {
-            for (const sec of sections) openSections.add(sec.id);
-        }
-        initializedPresetSections = true;
+    for (let i = 0; i < sections.length; i++) {
+        sections[i].hasVisibleChild = false;
+    }
+    for (let i = 0; i < subheaders.length; i++) {
+        subheaders[i].hasVisibleChild = false;
     }
 
-    // Pasada 2: determinar visibilidad de módulos hoja y propagar a cabeceras cuando hay filtro
-    const shouldHide = new Array(rows.length).fill(false);
-    let totalLeafPrompts = 0;
+    // Pasada 1 (en memoria): determinar visibilidad de módulos hoja y propagar a cabeceras
     let visibleLeafPrompts = 0;
+    for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (entry.isSectionHeader || entry.isSubheaderRow) continue;
 
-    for (let i = 0; i < rows.length; i++) {
-        const info = rowInfo[i];
-        if (info.isSectionHeader || info.isSubheaderRow) continue;
-
-        totalLeafPrompts++;
         let hide = false;
-
         if (isFiltered) {
-            const matchesActive = !onlyActiveFilter || info.isEnabled;
-            const matchesQuery = query.length === 0 || info.meta.searchText.includes(query);
+            const matchesActive = !onlyActiveFilter || entry.isEnabled;
+            const matchesQuery = query.length === 0 || entry.meta.searchText.includes(query);
             hide = !(matchesActive && matchesQuery);
-        } else if (settings.sectionsEnabled && info.section) {
-            hide = !openSections.has(info.section.id);
+        } else if (settings.sectionsEnabled && entry.section) {
+            hide = !openSections.has(entry.section.id);
         }
 
-        shouldHide[i] = hide;
+        entry.nextHide = hide;
         if (!hide) {
             visibleLeafPrompts++;
-            if (info.section) info.section.hasVisibleChild = true;
-            if (info.subheader) info.subheader.hasVisibleChild = true;
+            if (entry.section) entry.section.hasVisibleChild = true;
+            if (entry.subheader) entry.subheader.hasVisibleChild = true;
         }
     }
 
-    // Visibilidad de subcabeceras (<...>) y secciones (===)
-    for (const sub of subheaders) {
-        const info = rowInfo[sub.index];
+    for (let i = 0; i < subheaders.length; i++) {
+        const sub = subheaders[i];
+        const entry = sub.entry;
         if (isFiltered) {
-            const selfMatches = !onlyActiveFilter && query.length > 0 && info.meta.searchText.includes(query);
-            shouldHide[sub.index] = !(sub.hasVisibleChild || selfMatches);
-        } else if (settings.sectionsEnabled && info.section) {
-            shouldHide[sub.index] = !openSections.has(info.section.id);
-        }
-    }
-
-    for (const sec of sections) {
-        const info = rowInfo[sec.headerIndex];
-        if (isFiltered) {
-            const selfMatches = !onlyActiveFilter && query.length > 0 && info.meta.searchText.includes(query);
-            shouldHide[sec.headerIndex] = !(sec.hasVisibleChild || selfMatches);
+            const selfMatches = !onlyActiveFilter && query.length > 0 && entry.meta.searchText.includes(query);
+            entry.nextHide = !(sub.hasVisibleChild || selfMatches);
+        } else if (settings.sectionsEnabled && sub.section) {
+            entry.nextHide = !openSections.has(sub.section.id);
         } else {
-            shouldHide[sec.headerIndex] = false;
+            entry.nextHide = false;
         }
     }
 
-    // Pasada 3: aplicar únicamente diferencias mínimas de clases/atributos al DOM
-    for (let i = 0; i < rows.length; i++) {
-        const row = rows[i];
-        const info = rowInfo[i];
-
-        if (row.classList.contains('lpg-section') !== info.isSectionHeader) {
-            row.classList.toggle('lpg-section', info.isSectionHeader);
+    for (let i = 0; i < sections.length; i++) {
+        const sec = sections[i];
+        const entry = sec.headerEntry;
+        if (isFiltered) {
+            const selfMatches = !onlyActiveFilter && query.length > 0 && entry.meta.searchText.includes(query);
+            entry.nextHide = !(sec.hasVisibleChild || selfMatches);
+        } else {
+            entry.nextHide = false;
         }
-        if (row.classList.contains('lpg-subheader') !== info.isSubheaderRow) {
-            row.classList.toggle('lpg-subheader', info.isSubheaderRow);
+    }
+
+    // Pasada 2: aplicar únicamente diferencias respecto al estado cacheado en memoria (0 lecturas DOM)
+    for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const row = entry.row;
+
+        if (entry.domSection !== entry.isSectionHeader) {
+            entry.domSection = entry.isSectionHeader;
+            row.classList.toggle('lpg-section', entry.isSectionHeader);
+        }
+        if (entry.domSubheader !== entry.isSubheaderRow) {
+            entry.domSubheader = entry.isSubheaderRow;
+            row.classList.toggle('lpg-subheader', entry.isSubheaderRow);
         }
 
-        if (info.isSectionHeader) {
-            const isOpen = isFiltered || openSections.has(info.section.id);
-            if (row.classList.contains('lpg-open') !== isOpen) {
+        if (entry.isSectionHeader) {
+            const isOpen = isFiltered || openSections.has(entry.section.id);
+            if (entry.domOpen !== isOpen) {
+                entry.domOpen = isOpen;
                 row.classList.toggle('lpg-open', isOpen);
             }
-            const badge = `${info.section.active}/${info.section.total}`;
-            if (row.getAttribute('data-lpg-badge') !== badge) {
+            const badge = `${entry.section.active}/${entry.section.total}`;
+            if (entry.domBadge !== badge) {
+                entry.domBadge = badge;
                 row.setAttribute('data-lpg-badge', badge);
             }
         } else {
-            if (row.classList.contains('lpg-open')) row.classList.remove('lpg-open');
-            if (row.hasAttribute('data-lpg-badge')) row.removeAttribute('data-lpg-badge');
+            if (entry.domOpen) {
+                entry.domOpen = false;
+                row.classList.remove('lpg-open');
+            }
+            if (entry.domBadge !== null) {
+                entry.domBadge = null;
+                row.removeAttribute('data-lpg-badge');
+            }
         }
 
-        const hide = shouldHide[i];
-        if (row.classList.contains('lpg-hidden') !== hide) {
+        const hide = entry.nextHide;
+        if (entry.domHidden !== hide) {
+            entry.domHidden = hide;
             row.classList.toggle('lpg-hidden', hide);
         }
     }
@@ -793,6 +1197,82 @@ function applyVisibilityNow() {
     if (countEl) {
         countEl.textContent = isFiltered ? `${visibleLeafPrompts}/${totalLeafPrompts}` : '';
     }
+}
+
+/**
+ * Actualiza en O(1) el índice en memoria y el badge de sección tras alternar un único módulo.
+ * @param {Element} row
+ * @param {boolean} newEnabled
+ */
+function updateIndexForSingleToggle(row, newEnabled) {
+    if (pmIndexDirty || !pmIndex || pmIndex.listEl !== row.parentElement) {
+        scheduleVisibilityUpdate();
+        return;
+    }
+
+    const entry = pmIndex.byRow.get(row);
+    if (!entry) {
+        scheduleVisibilityUpdate();
+        return;
+    }
+
+    if (entry.isEnabled === newEnabled) return;
+    entry.isEnabled = newEnabled;
+
+    if (!entry.isSectionHeader && !entry.isSubheaderRow && entry.section) {
+        entry.section.active += newEnabled ? 1 : -1;
+        const headerEntry = entry.section.headerEntry;
+        const badge = `${entry.section.active}/${entry.section.total}`;
+        if (headerEntry.domBadge !== badge) {
+            headerEntry.domBadge = badge;
+            headerEntry.row.setAttribute('data-lpg-badge', badge);
+        }
+    }
+
+    if (onlyActiveFilter) {
+        applyVisibilityNow();
+    }
+}
+
+/**
+ * Expande o colapsa únicamente las filas de una sección en O(sección) cuando no hay filtro activo.
+ * @param {Element} sectionRow
+ */
+function toggleSectionByRow(sectionRow) {
+    const meta = getRowMeta(sectionRow, 0);
+    let nowOpen;
+    if (openSections.has(meta.id)) {
+        openSections.delete(meta.id);
+        nowOpen = false;
+    } else {
+        openSections.add(meta.id);
+        nowOpen = true;
+    }
+
+    const query = (document.getElementById('lpg-prompt-search')?.value || '').trim();
+    const isFiltered = query.length > 0 || onlyActiveFilter;
+
+    if (!isFiltered && !pmIndexDirty && pmIndex && pmIndex.listEl === sectionRow.parentElement) {
+        const headerEntry = pmIndex.byRow.get(sectionRow);
+        if (headerEntry?.section) {
+            if (headerEntry.domOpen !== nowOpen) {
+                headerEntry.domOpen = nowOpen;
+                sectionRow.classList.toggle('lpg-open', nowOpen);
+            }
+            const hide = !nowOpen;
+            const members = headerEntry.section.memberEntries;
+            for (let i = 0; i < members.length; i++) {
+                const m = members[i];
+                if (m.domHidden !== hide) {
+                    m.domHidden = hide;
+                    m.row.classList.toggle('lpg-hidden', hide);
+                }
+            }
+            return;
+        }
+    }
+
+    scheduleVisibilityUpdate();
 }
 
 /**
@@ -809,18 +1289,25 @@ function setAllSectionsOpen(expand) {
     const listEl = document.getElementById('completion_prompt_manager_list');
     if (!listEl) return;
 
-    const rows = listEl.querySelectorAll(':scope > .completion_prompt_manager_prompt');
-    for (let i = 0; i < rows.length; i++) {
-        const meta = getRowMeta(rows[i], i);
-        if (meta.isSection) {
-            openSections.add(meta.id);
+    if (!pmIndexDirty && pmIndex && pmIndex.listEl === listEl) {
+        const sections = pmIndex.sections;
+        for (let i = 0; i < sections.length; i++) {
+            openSections.add(sections[i].id);
+        }
+    } else {
+        const rows = listEl.querySelectorAll(':scope > .completion_prompt_manager_prompt');
+        for (let i = 0; i < rows.length; i++) {
+            const meta = getRowMeta(rows[i], i);
+            if (meta.isSection) {
+                openSections.add(meta.id);
+            }
         }
     }
     scheduleVisibilityUpdate();
 }
 
 /**
- * Monta la barra compacta (buscador + Solo ON + expandir/colapsar + ↻) ANTES de #completion_prompt_manager.
+ * Monta la barra compacta (buscador + Solo ON + expandir/colapsar + ⇅ + ↻) ANTES de #completion_prompt_manager.
  */
 function mountToolbar() {
     if (document.getElementById('lpg-toolbar')) return;
@@ -836,7 +1323,7 @@ function mountToolbar() {
             type="text"
             id="lpg-prompt-search"
             class="text_pole"
-            placeholder="Buscar módulo Nemo..."
+            placeholder="Buscar módulo..."
             autocomplete="off"
             autocorrect="off"
             autocapitalize="off"
@@ -848,6 +1335,7 @@ function mountToolbar() {
         <button type="button" id="lpg-only-active" class="menu_button lpg-tool-btn" aria-pressed="false" title="Mostrar solo prompts activos">Solo ON</button>
         <button type="button" id="lpg-expand-all" class="menu_button lpg-tool-btn lpg-sec-btn" title="Expandir todas las secciones" aria-label="Expandir secciones">+</button>
         <button type="button" id="lpg-collapse-all" class="menu_button lpg-tool-btn lpg-sec-btn" title="Colapsar todas las secciones" aria-label="Colapsar secciones">&minus;</button>
+        <button type="button" id="lpg-reorder-mode" class="menu_button lpg-tool-btn" aria-pressed="false" title="Activar/desactivar arrastrar para reordenar módulos" aria-label="Reordenar módulos">&#8645;</button>
         <button type="button" id="lpg-recalc-tokens" class="menu_button lpg-tool-btn" title="Recalcular tokens del preset" aria-label="Recalcular tokens">&#8635;</button>
     `;
 
@@ -858,6 +1346,7 @@ function mountToolbar() {
     const activeBtn = toolbar.querySelector('#lpg-only-active');
     const expandBtn = toolbar.querySelector('#lpg-expand-all');
     const collapseBtn = toolbar.querySelector('#lpg-collapse-all');
+    const reorderBtn = toolbar.querySelector('#lpg-reorder-mode');
     const recalcBtn = toolbar.querySelector('#lpg-recalc-tokens');
 
     input.addEventListener('input', () => {
@@ -895,47 +1384,85 @@ function mountToolbar() {
 
     expandBtn.addEventListener('click', () => setAllSectionsOpen(true));
     collapseBtn.addEventListener('click', () => setAllSectionsOpen(false));
+    reorderBtn.addEventListener('click', () => {
+        reorderMode = !reorderMode;
+        syncSortableMode();
+    });
     recalcBtn.addEventListener('click', forceRecalculateTokens);
+    syncSortableMode();
 }
 
 /**
- * Alterna en el acto (in-place, <1 ms) un módulo del Prompt Manager sin reconstruir los 600+ nodos.
+ * Busca una entrada en prompt_order en O(1) usando un Map cacheado en memoria.
+ * @param {object} pm
+ * @param {string} promptId
+ * @returns {object | null}
+ */
+function getPromptOrderEntryFast(pm, promptId) {
+    const activeChar = pm.activeCharacter
+        ?? (pm.configuration?.promptOrder?.strategy === 'global' ? { id: pm.configuration.promptOrder.dummyId } : null);
+    if (!activeChar) return null;
+
+    const orderArr = pm.getPromptOrderForCharacter?.(activeChar);
+    if (Array.isArray(orderArr)) {
+        if (orderArr !== cachedOrderArrayRef || orderArr.length !== cachedOrderLength) {
+            promptOrderMap.clear();
+            for (let i = 0; i < orderArr.length; i++) {
+                const item = orderArr[i];
+                if (item && item.identifier) {
+                    promptOrderMap.set(item.identifier, item);
+                }
+            }
+            cachedOrderArrayRef = orderArr;
+            cachedOrderLength = orderArr.length;
+        }
+        const found = promptOrderMap.get(promptId);
+        if (found) return found;
+    }
+
+    return pm.getPromptOrderEntry?.(activeChar, promptId) ?? null;
+}
+
+/**
+ * Alterna en el acto (in-place, O(1)) un módulo del Prompt Manager sin reconstruir ni re-escanear nodos.
  * @param {Element} toggleEl
- * @param {MouseEvent} event
+ * @param {Event | null} event
  * @returns {boolean} true si se manejó en el acto
  */
 function handleInstantToggle(toggleEl, event) {
-    if (!getSettings().fastToggle || !promptManager || !promptManager.activeCharacter) return false;
+    if (!getSettings().fastToggle || !promptManager) return false;
 
     const row = toggleEl.closest('.completion_prompt_manager_prompt');
     const promptId = row?.dataset?.pmIdentifier;
     if (!promptId) return false;
 
-    const entry = promptManager.getPromptOrderEntry?.(promptManager.activeCharacter, promptId);
+    const entry = getPromptOrderEntryFast(promptManager, promptId);
     if (!entry) return false;
 
-    event.preventDefault();
-    event.stopPropagation();
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    event?.stopImmediatePropagation?.();
 
     const counts = promptManager.tokenHandler?.getCounts?.();
-    if (counts) {
+    if (counts && counts[promptId] !== null) {
         counts[promptId] = null;
     }
 
-    entry.enabled = !entry.enabled;
+    const enabled = !entry.enabled;
+    entry.enabled = enabled;
 
-    row.classList.toggle('completion_prompt_manager_prompt_disabled', !entry.enabled);
-    toggleEl.classList.toggle('fa-toggle-on', entry.enabled);
-    toggleEl.classList.toggle('fa-toggle-off', !entry.enabled);
+    row.classList.toggle('completion_prompt_manager_prompt_disabled', !enabled);
+    toggleEl.classList.toggle('fa-toggle-on', enabled);
+    toggleEl.classList.toggle('fa-toggle-off', !enabled);
 
     const tokEl = row.querySelector('.prompt_manager_prompt_tokens');
-    if (tokEl) {
+    if (tokEl && tokEl.dataset.pmTokens !== '-') {
         tokEl.dataset.pmTokens = '-';
         tokEl.textContent = '-';
     }
 
-    promptManager.saveServiceSettings?.();
-    scheduleVisibilityUpdate();
+    updateIndexForSingleToggle(row, enabled);
+    scheduleSmartSettingsSave();
     return true;
 }
 
@@ -968,13 +1495,7 @@ function bindPromptManagerDelegatedClicks() {
         event.preventDefault();
         event.stopPropagation();
 
-        const meta = getRowMeta(sectionRow, 0);
-        if (openSections.has(meta.id)) {
-            openSections.delete(meta.id);
-        } else {
-            openSections.add(meta.id);
-        }
-        scheduleVisibilityUpdate();
+        toggleSectionByRow(sectionRow);
     }, true);
 
     sectionClickBound = true;
@@ -1032,7 +1553,8 @@ function bindInstantEditSave() {
             }
         }
 
-        promptManager.saveServiceSettings?.();
+        invalidatePmIndex();
+        scheduleSmartSettingsSave();
         scheduleVisibilityUpdate();
     }, true);
 
@@ -1051,11 +1573,15 @@ function attachListObserver() {
     const listEl = document.getElementById('completion_prompt_manager_list');
     if (!listEl) return;
 
+    invalidatePmIndex();
     listObserver = new MutationObserver(() => {
+        invalidatePmIndex();
+        syncSortableMode();
         scheduleVisibilityUpdate();
     });
     listObserver.observe(listEl, { childList: true, subtree: false });
 
+    syncSortableMode();
     scheduleVisibilityUpdate();
 }
 
@@ -1077,6 +1603,7 @@ function observePromptManager() {
     }
 
     containerObserver = new MutationObserver(() => {
+        invalidatePmIndex();
         patchPromptManager();
         attachListObserver();
     });
@@ -1558,10 +2085,10 @@ function mountExtensionSettings() {
     refreshRegexStatsUI();
 
     const bindings = [
-        ['#lpg-setting-sections', 'sectionsEnabled', () => scheduleVisibilityUpdate()],
+        ['#lpg-setting-sections', 'sectionsEnabled', () => { invalidatePmIndex(); scheduleVisibilityUpdate(); }],
         ['#lpg-setting-collapsed', 'startCollapsed', (v) => setAllSectionsOpen(!v)],
         ['#lpg-setting-defer-render', 'deferHiddenRender', () => {}],
-        ['#lpg-setting-fast-toggle', 'fastToggle', () => {}],
+        ['#lpg-setting-fast-toggle', 'fastToggle', () => syncSortableMode()],
         ['#lpg-setting-cv', 'contentVisibilityEnabled', () => syncContentVisibility()],
         ['#lpg-setting-gpu-lite', 'gpuLiteEnabled', () => syncGpuLite()],
         ['#lpg-setting-lazy-img', 'lazyImagesEnabled', (v) => { if (v) observeLazyContainers(); }],
@@ -1596,17 +2123,23 @@ function registerSillyTavernEvents() {
     };
 
     const resetPresetSections = () => {
+        flushPendingSettingsSave(true);
         if (!isAiConfigPanelOpen()) {
             deferredStructureDirty = true;
         }
         initializedPresetSections = false;
         openSections.clear();
+        cachedOrderArrayRef = null;
+        cachedOrderLength = -1;
+        promptOrderMap.clear();
+        invalidatePmIndex();
         refresh();
     };
 
     if (event_types?.APP_READY) eventSource.on(event_types.APP_READY, refresh);
     if (event_types?.CHAT_CHANGED) {
         eventSource.on(event_types.CHAT_CHANGED, () => {
+            flushPendingSettingsSave(true);
             lastLowerSrc = '';
             lastLowerVal = '';
             refresh();
@@ -1619,12 +2152,18 @@ function registerSillyTavernEvents() {
             if (!isAiConfigPanelOpen()) deferredStructureDirty = true;
         });
     }
+    if (event_types?.OAI_PRESET_CHANGED_BEFORE) {
+        eventSource.on(event_types.OAI_PRESET_CHANGED_BEFORE, () => flushPendingSettingsSave(true));
+    }
     if (event_types?.OAI_PRESET_CHANGED_AFTER) eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, resetPresetSections);
     if (event_types?.MAIN_API_CHANGED) eventSource.on(event_types.MAIN_API_CHANGED, resetPresetSections);
 
     for (const evt of ['GENERATION_STARTED', 'GENERATION_ENDED', 'MESSAGE_SENT', 'MESSAGE_RECEIVED', 'MESSAGE_DELETED', 'MESSAGE_EDITED']) {
         if (event_types?.[evt]) {
             eventSource.on(event_types[evt], () => {
+                if (evt === 'GENERATION_STARTED' || evt === 'MESSAGE_SENT') {
+                    flushPendingSettingsSave(true);
+                }
                 patchPromptManager();
                 patchRegexProvider();
             });
@@ -1645,6 +2184,8 @@ jQuery(() => {
     syncGpuLite();
     syncChatCssGuard();
     mountExtensionSettings();
+    bindLifecycleSaveFlush();
+    bindPanelInteractionTracker();
     patchPromptManager();
     patchRegexProvider();
     observeDrawerOpen();
@@ -1656,5 +2197,6 @@ jQuery(() => {
         patchPromptManager();
         patchRegexProvider();
         bindInstantEditSave();
+        bindPanelInteractionTracker();
     }, 1500);
 });
